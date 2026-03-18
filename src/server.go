@@ -148,6 +148,9 @@ type RouteRequest struct {
 	// Optional corridor similarity threshold for filtering near-duplicate alternatives.
 	// Range: [0,1]. Higher values allow more similar alternatives.
 	CorridorSimilarityThreshold *float64 `json:"corridor_similarity_threshold"`
+	SnapK                     *int    `json:"snap_k"`
+	MaxPairs                  *int    `json:"max_pairs"`
+	SearchK                   *int    `json:"search_k"`
 }
 
 type RouteResponse struct {
@@ -160,6 +163,17 @@ type RouteResponse struct {
 		RouteMs   int64 `json:"route_ms"`
 		TotalMs   int64 `json:"total_ms"`
 	} `json:"timings"`
+}
+
+type RoutePhaseTimings struct {
+	KNearestMs      int64 `json:"k_nearest_ms"`
+	PairGenerationMs int64 `json:"pair_generation_ms"`
+	SearchMs        int64 `json:"search_ms"`
+	RankingMs       int64 `json:"ranking_ms"`
+	TotalMs         int64 `json:"total_ms"`
+	PairsTried      int   `json:"pairs_tried,omitempty"`
+	RouteKCalls     int   `json:"routek_calls,omitempty"`
+	CandidatesFound int   `json:"candidates_found,omitempty"`
 }
 
 type TripPathsRequest struct {
@@ -182,6 +196,9 @@ type TripPathsRequest struct {
 	TargetTravelSec *float64 `json:"target_travel_sec"`
 	// Optional journey legs used to rank each segment by real-world scheduled time.
 	Legs []TripTimingLeg `json:"legs"`
+	SnapK     *int    `json:"snap_k"`
+	MaxPairs  *int    `json:"max_pairs"`
+	SearchK   *int    `json:"search_k"`
 }
 
 type TripTimingLeg struct {
@@ -206,6 +223,13 @@ type TripPathsV1Request struct {
 	DepartureSec    *int     `json:"departure_sec"`
 	ArrivalSec      *int     `json:"arrival_sec"`
 	TargetTravelSec *float64 `json:"target_travel_sec"`
+	SnapK           *int     `json:"snap_k"`
+	MaxPairs        *int     `json:"max_pairs"`
+	SearchK         *int     `json:"search_k"`
+	// Optional TAD-style fields for single-trip requests.
+	StopIDs    []string `json:"stop_ids"`
+	FromStopID string   `json:"from_stop_id"`
+	ToStopID   string   `json:"to_stop_id"`
 }
 
 func (r TripPathsRequest) UseAccelDecel() bool {
@@ -216,6 +240,56 @@ func (r TripPathsRequest) UseAccelDecel() bool {
 		return *r.UseAccelDecelCamel
 	}
 	return true
+}
+
+type routeSearchTuning struct {
+	SnapK     int
+	MaxPairs  int
+	SearchK   int
+}
+
+func routeSearchDefaults(k int) routeSearchTuning {
+	switch {
+	case k <= 2:
+		return routeSearchTuning{
+			SnapK:    6,
+			MaxPairs: 40,
+			SearchK:  8,
+		}
+	case k <= 3:
+		return routeSearchTuning{
+			SnapK:    8,
+			MaxPairs: 60,
+			SearchK:  10,
+		}
+	case k <= 5:
+		return routeSearchTuning{
+			SnapK:    10,
+			MaxPairs: 100,
+			SearchK:  12,
+		}
+	default:
+		return routeSearchTuning{
+			SnapK:    10,
+			MaxPairs: 120,
+			SearchK:  16,
+		}
+	}
+}
+
+func clampPositiveInt(v *int, fallback, lo, hi int) int {
+	if v == nil || *v <= 0 {
+		return fallback
+	}
+	return clampInt(*v, lo, hi)
+}
+
+func resolveTopKTuning(k int, snapK, maxPairs, searchK *int) routeSearchTuning {
+	opts := routeSearchDefaults(k)
+	opts.SnapK = clampPositiveInt(snapK, opts.SnapK, 1, 20)
+	opts.MaxPairs = clampPositiveInt(maxPairs, opts.MaxPairs, 1, 240)
+	opts.SearchK = clampPositiveInt(searchK, opts.SearchK, 1, 40)
+	return opts
 }
 
 type TripStopSpec struct {
@@ -249,8 +323,9 @@ type SegmentPaths struct {
 }
 
 type SegmentTimings struct {
-	ResolveMs int64 `json:"resolve_ms"`
-	RouteMs   int64 `json:"route_ms"`
+	ResolveMs int64             `json:"resolve_ms"`
+	RouteMs   int64             `json:"route_ms"`
+	Phases   *RoutePhaseTimings `json:"phases,omitempty"`
 }
 
 type TripPathsResponse struct {
@@ -312,9 +387,39 @@ func (s *Server) handleTripPathsV1(w http.ResponseWriter, r *http.Request) {
 		ArrivalSec:                  reqV1.ArrivalSec,
 		TargetTravelSec:             reqV1.TargetTravelSec,
 		Legs:                        reqV1.Legs,
+		SnapK:                       reqV1.SnapK,
+		MaxPairs:                    reqV1.MaxPairs,
+		SearchK:                     reqV1.SearchK,
 	}
 	for _, st := range reqV1.Stops {
 		legacy.Stops = append(legacy.Stops, stopRefToTripStopSpec(st))
+	}
+
+	// If no explicit stops were provided but we have stop_ids from a TAD-style
+	// request, synthesize TripStopSpecs from those IDs.
+	if len(legacy.Stops) == 0 && len(reqV1.StopIDs) > 0 {
+		for _, id := range reqV1.StopIDs {
+			idCopy := strings.TrimSpace(id)
+			if idCopy == "" {
+				continue
+			}
+			spec := TripStopSpec{}
+			spec.IFOPT = &idCopy
+			legacy.Stops = append(legacy.Stops, spec)
+		}
+	}
+	// Fallback: if we still do not have 2 stops but have from_stop_id/to_stop_id,
+	// build a minimal two-stop journey from those IDs.
+	if len(legacy.Stops) < 2 && strings.TrimSpace(reqV1.FromStopID) != "" && strings.TrimSpace(reqV1.ToStopID) != "" {
+		fromID := strings.TrimSpace(reqV1.FromStopID)
+		toID := strings.TrimSpace(reqV1.ToStopID)
+		if fromID != "" && toID != "" {
+			specFrom := TripStopSpec{}
+			specTo := TripStopSpec{}
+			specFrom.IFOPT = &fromID
+			specTo.IFOPT = &toID
+			legacy.Stops = append(legacy.Stops, specFrom, specTo)
+		}
 	}
 
 	// Reuse the legacy handler logic by calling the core implementation.
@@ -445,7 +550,8 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 	if corridorThreshold > 1 {
 		corridorThreshold = 1
 	}
-	log.Printf("[%s] request config k=%d algo=%s use_accel_decel=%t corridor_similarity_threshold=%.3f", reqID, k, algo, useAccelDecel, corridorThreshold)
+	routing := resolveTopKTuning(k, req.SnapK, req.MaxPairs, req.SearchK)
+	log.Printf("[%s] request config k=%d algo=%s use_accel_decel=%t corridor_similarity_threshold=%.3f snap_k=%d max_pairs=%d search_k=%d", reqID, k, algo, useAccelDecel, corridorThreshold, routing.SnapK, routing.MaxPairs, routing.SearchK)
 
 	tResolve0 := time.Now()
 	stops := make([]ResolvedStop, 0, len(req.Stops))
@@ -486,24 +592,45 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 			start := aCoord
 			goal := bCoord
 			log.Printf("[%s] segment %d routing start latlon=(%.6f,%.6f)->(%.6f,%.6f)", reqID, i, start[0], start[1], goal[0], goal[1])
-			topk, routeErr := RouteStationsTopK(s.graph, start, goal, TopKOptions{
-				K:                           k,
-				SnapK:                       10,
-				MaxPairs:                    220,
+			targetSec, hasTarget := segmentTargetTravelSeconds(req, a, b, len(stops)-1)
+			// Over-generate for ranking when we have a schedule target, so the
+			// ranker can surface realistic but slightly longer routes.
+			searchK := k
+			if hasTarget && searchK < 8 {
+				searchK = 8
+			}
+			routeTuning := resolveTopKTuning(searchK, req.SnapK, req.MaxPairs, req.SearchK)
+			topk, routeTimings, routeErr := RouteStationsTopK(s.graph, start, goal, TopKOptions{
+				K:                           searchK,
+				SnapK:                       routeTuning.SnapK,
+				MaxPairs:                    routeTuning.MaxPairs,
+				SearchK:                     routeTuning.SearchK,
 				Algorithm:                   algo,
 				UseAccelDecel:               useAccelDecel,
 				CorridorSimilarityThreshold: corridorThreshold,
+				TargetTravelSec:             targetSec,
 			})
 			if routeErr != nil {
 				log.Printf("[%s] segment %d route error: %v", reqID, i, routeErr)
 			}
+			for _, candidate := range topk {
+				if candidate != nil {
+					candidate.Timings.Phases = &routeTimings
+				}
+			}
 			seg.TopK = topk
-			targetSec, hasTarget := segmentTargetTravelSeconds(req, a, b, len(stops)-1)
 			if hasTarget {
 				rankTopKByTargetTravelTime(seg.TopK, targetSec)
 			}
 			annotateTopKRanking(seg.TopK, targetSec, hasTarget)
+			if len(seg.TopK) > k {
+				seg.TopK = seg.TopK[:k]
+			}
 			seg.Timings.RouteMs = time.Since(segRoute0).Milliseconds()
+			if routeTimings.TotalMs > 0 {
+				seg.Timings.RouteMs = routeTimings.TotalMs
+			}
+			seg.Timings.Phases = &routeTimings
 			totalRouteMs += seg.Timings.RouteMs
 			best := "none"
 			if len(topk) > 0 {
@@ -898,7 +1025,8 @@ type PathRanking struct {
 }
 
 type PathTimings struct {
-	RouteMs int64 `json:"route_ms"`
+	RouteMs int64             `json:"route_ms"`
+	Phases *RoutePhaseTimings `json:"phases,omitempty"`
 }
 
 func annotateTopKRanking(topk []*PathResult, targetSec float64, hasTarget bool) {
@@ -1086,20 +1214,32 @@ func (s *Server) handleRouteV1(w http.ResponseWriter, r *http.Request) {
 	if corridorThreshold > 1 {
 		corridorThreshold = 1
 	}
+	routeTuning := resolveTopKTuning(k, req.SnapK, req.MaxPairs, req.SearchK)
+	log.Printf("route request config k=%d algo=%s use_accel_decel=%t corridor_similarity_threshold=%.3f snap_k=%d max_pairs=%d search_k=%d", k, algo, useAccelDecel, corridorThreshold, routeTuning.SnapK, routeTuning.MaxPairs, routeTuning.SearchK)
 
 	tRoute0 := time.Now()
-	topk, routeErr := RouteStationsTopK(s.graph, fromCoord, toCoord, TopKOptions{
+	topk, routeTimings, routeErr := RouteStationsTopK(s.graph, fromCoord, toCoord, TopKOptions{
 		K:                           k,
-		SnapK:                       10,
-		MaxPairs:                    220,
+		SnapK:                       routeTuning.SnapK,
+		MaxPairs:                    routeTuning.MaxPairs,
+		SearchK:                     routeTuning.SearchK,
 		Algorithm:                   algo,
 		UseAccelDecel:               useAccelDecel,
 		CorridorSimilarityThreshold: corridorThreshold,
 	})
-	routeMs := time.Since(tRoute0).Milliseconds()
 	if routeErr != nil {
 		http.Error(w, routeErr.Error(), http.StatusBadRequest)
 		return
+	}
+	routeMs := routeTimings.TotalMs
+	if routeMs <= 0 {
+		routeMs = time.Since(tRoute0).Milliseconds()
+		routeTimings.TotalMs = routeMs
+	}
+	for _, candidate := range topk {
+		if candidate != nil {
+			candidate.Timings.Phases = &routeTimings
+		}
 	}
 
 	var resp RouteResponse

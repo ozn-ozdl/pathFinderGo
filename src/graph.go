@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +56,10 @@ type TopKOptions struct {
 	// SearchK controls how many candidates RouteK generates per snap-pair.
 	// If zero, it is derived from K (over-generated) to improve chances of returning K results.
 	SearchK int
+	// Optional soft target travel time (seconds). When > 0, RouteStationsTopK will
+	// lightly bias scoring toward candidates whose estimated travel duration is
+	// closer to this value, especially avoiding unrealistically short routes.
+	TargetTravelSec float64
 }
 
 type RouteStats struct {
@@ -105,6 +110,58 @@ var routeSearchStatePool = sync.Pool{
 	New: func() any {
 		return &routeSearchState{}
 	},
+}
+
+type routeKCacheKey struct {
+	start int
+	goal  int
+	k     int
+	algo  string
+}
+
+type routeKCacheEntry struct {
+	paths []routeCandidate
+}
+
+const routeKCacheMaxEntries = 256
+
+var routeKCache = struct {
+	mu    sync.RWMutex
+	data  map[routeKCacheKey]routeKCacheEntry
+	order []routeKCacheKey
+}{
+	data:  make(map[routeKCacheKey]routeKCacheEntry, routeKCacheMaxEntries),
+	order: make([]routeKCacheKey, 0, routeKCacheMaxEntries),
+}
+
+func getRouteKFromCache(key routeKCacheKey) ([]routeCandidate, bool) {
+	routeKCache.mu.RLock()
+	entry, ok := routeKCache.data[key]
+	routeKCache.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	// paths are treated as immutable by callers, so we can return as-is.
+	return entry.paths, true
+}
+
+func putRouteKInCache(key routeKCacheKey, paths []routeCandidate) {
+	if len(paths) == 0 {
+		return
+	}
+	routeKCache.mu.Lock()
+	defer routeKCache.mu.Unlock()
+	if _, exists := routeKCache.data[key]; exists {
+		return
+	}
+	// Evict oldest if at capacity.
+	if len(routeKCache.order) >= routeKCacheMaxEntries {
+		oldest := routeKCache.order[0]
+		routeKCache.order = routeKCache.order[1:]
+		delete(routeKCache.data, oldest)
+	}
+	routeKCache.data[key] = routeKCacheEntry{paths: paths}
+	routeKCache.order = append(routeKCache.order, key)
 }
 
 type railGraphCache struct {
@@ -344,8 +401,9 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 	return best, nil
 }
 
-func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOptions) ([]*PathResult, error) {
+func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOptions) ([]*PathResult, RoutePhaseTimings, error) {
 	t0 := time.Now()
+	phases := RoutePhaseTimings{}
 	desiredK := opt.K
 	if desiredK <= 0 {
 		desiredK = 3
@@ -381,10 +439,14 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 		}
 	}
 
+	snapStart := time.Now()
 	startCandidates := g.Grid.KNearest(fromLatLon[0], fromLatLon[1], snapK)
 	goalCandidates := g.Grid.KNearest(toLatLon[0], toLatLon[1], snapK)
+	phases.KNearestMs = time.Since(snapStart).Milliseconds()
+	phases.CandidatesFound = len(startCandidates) + len(goalCandidates)
 	if len(startCandidates) == 0 || len(goalCandidates) == 0 {
-		return []*PathResult{{GenerationStatus: "no-snap", Timings: PathTimings{RouteMs: time.Since(t0).Milliseconds()}}}, nil
+		phases.TotalMs = time.Since(t0).Milliseconds()
+		return []*PathResult{{GenerationStatus: "no-snap", Timings: PathTimings{RouteMs: phases.TotalMs, Phases: &phases}}}, phases, nil
 	}
 
 	type cand struct {
@@ -428,73 +490,145 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 		searchK = 40
 	}
 
-	pairsTried := 0
-searchPairs:
-	for i := 0; i < len(starts) && pairsTried < maxPairs; i++ {
-		for j := 0; j < len(goals) && pairsTried < maxPairs; j++ {
-			pairsTried++
-			si := starts[i].idx
-			gi := goals[j].idx
+	pairTimingStart := time.Now()
+	type pair struct {
+		i int
+		j int
+	}
+	type pairResult struct {
+		i         int
+		j         int
+		paths     []routeCandidate
+		elapsedMs int64
+	}
 
-			paths, err := RouteK(g, si, gi, algo, searchK)
-			if err != nil || len(paths) == 0 {
+	pairCh := make(chan pair)
+	resultCh := make(chan pairResult)
+
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount > 8 {
+		workerCount = 8
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			defer wg.Done()
+			for p := range pairCh {
+				si := starts[p.i].idx
+				gi := goals[p.j].idx
+				searchStart := time.Now()
+				paths, _ := RouteK(g, si, gi, algo, searchK)
+				elapsed := time.Since(searchStart).Milliseconds()
+				resultCh <- pairResult{
+					i:         p.i,
+					j:         p.j,
+					paths:     paths,
+					elapsedMs: elapsed,
+				}
+			}
+		}()
+	}
+
+	pairsTried := 0
+	go func() {
+		for i := 0; i < len(starts) && pairsTried < maxPairs; i++ {
+			for j := 0; j < len(goals) && pairsTried < maxPairs; j++ {
+				pairsTried++
+				pairCh <- pair{i: i, j: j}
+				if pairsTried >= maxPairs {
+					break
+				}
+			}
+		}
+		close(pairCh)
+		wg.Wait()
+		close(resultCh)
+	}()
+
+	for res := range resultCh {
+		phases.SearchMs += res.elapsedMs
+		if len(res.paths) == 0 {
+			continue
+		}
+		for _, path := range res.paths {
+			total := path.dist + starts[res.i].snap + goals[res.j].snap
+			dirPenalty := directionalPenaltyMeters(g, path.nodes, fromLatLon, toLatLon)
+			score := total + dirPenalty
+
+			key := path.key
+			if _, ok := seen[key]; ok {
 				continue
 			}
-			for _, path := range paths {
-				total := path.dist + starts[i].snap + goals[j].snap
-				dirPenalty := directionalPenaltyMeters(g, path.nodes, fromLatLon, toLatLon)
-				score := total + dirPenalty
+			candEdges := pathEdgeSet(path.nodes)
+			seen[key] = struct{}{}
 
-				key := path.key
-				if _, ok := seen[key]; ok {
-					continue
-				}
-				candEdges := pathEdgeSet(path.nodes)
-				seen[key] = struct{}{}
+			coords := make([][2]float64, 0, len(path.nodes)+2)
+			coords = append(coords, fromLatLon)
+			for _, idx := range path.nodes {
+				coords = append(coords, g.NodeCoords[idx])
+			}
+			coords = append(coords, toLatLon)
 
-				coords := make([][2]float64, 0, len(path.nodes)+2)
-				coords = append(coords, fromLatLon)
-				for _, idx := range path.nodes {
-					coords = append(coords, g.NodeCoords[idx])
-				}
-				coords = append(coords, toLatLon)
-
-				pr := &PathResult{
-					Coords:             coords,
-					DistanceMeters:     total,
-					EstimatedTravelSec: estimateTravelSeconds(path.path, starts[i].snap, goals[j].snap, useAccelDecel),
-					WayIDs:             path.ways,
-					SnapFromMeters:     starts[i].snap,
-					SnapToMeters:       goals[j].snap,
-					VisitedNodes:       path.stats.Visited,
-					RelaxedEdges:       path.stats.Relaxed,
-					Algorithm:          algo,
-					GenerationStatus:   "ok",
-					Timings:            PathTimings{RouteMs: path.routeMs},
-				}
-
-				cand := topKScored{key: key, score: score, res: pr, edges: candEdges}
-				if isSameCorridor(candEdges, best, corridorSimilarityThreshold) {
-					fallback = append(fallback, cand)
-					continue
-				}
-				best = append(best, cand)
-				sort.Slice(best, func(a, b int) bool { return best[a].score < best[b].score })
-				if len(best) > desiredK {
-					// Keep strongest diverse results; extras stay available for backfill.
-					fallback = append(fallback, best[len(best)-1])
-					best = best[:desiredK]
+			estSec := estimateTravelSeconds(path.path, starts[res.i].snap, goals[res.j].snap, useAccelDecel)
+			// Soft time penalty: nudge search away from implausibly short/long
+			// options when a target is known, without making travel time the
+			// primary objective (that remains geometric).
+			if opt.TargetTravelSec > 0 && estSec > 0 {
+				diff := math.Abs(estSec - opt.TargetTravelSec)
+				// Convert seconds to "pseudo-meters" using ~25 m/s (~90 km/h).
+				score += diff * 25.0
+				if estSec < opt.TargetTravelSec {
+					// Extra penalty for being shorter than target; many "too fast"
+					// routes are unrealistic compared to timetable.
+					score += (opt.TargetTravelSec - estSec) * 15.0
 				}
 			}
-			if len(best) >= desiredK && desiredK <= 2 {
-				break searchPairs
+
+			pr := &PathResult{
+				Coords:             coords,
+				DistanceMeters:     total,
+				EstimatedTravelSec: estSec,
+				WayIDs:             path.ways,
+				SnapFromMeters:     starts[res.i].snap,
+				SnapToMeters:       goals[res.j].snap,
+				VisitedNodes:       path.stats.Visited,
+				RelaxedEdges:       path.stats.Relaxed,
+				Algorithm:          algo,
+				GenerationStatus:   "ok",
+				Timings:            PathTimings{RouteMs: path.routeMs},
+			}
+
+			cand := topKScored{key: key, score: score, res: pr, edges: candEdges}
+			if isSameCorridor(candEdges, best, corridorSimilarityThreshold) {
+				fallback = append(fallback, cand)
+				continue
+			}
+			best = append(best, cand)
+			sort.Slice(best, func(a, b int) bool { return best[a].score < best[b].score })
+			if len(best) > desiredK {
+				// Keep strongest diverse results; extras stay available for backfill.
+				fallback = append(fallback, best[len(best)-1])
+				best = best[:desiredK]
 			}
 		}
 	}
+	phases.RouteKCalls += pairsTried
+	phases.PairsTried = pairsTried
+	pairElapsed := time.Since(pairTimingStart).Milliseconds()
+	if pairElapsed > phases.SearchMs {
+		phases.PairGenerationMs = pairElapsed - phases.SearchMs
+	}
 
 	if len(best) == 0 {
-		return []*PathResult{{GenerationStatus: "no-route", Timings: PathTimings{RouteMs: time.Since(t0).Milliseconds()}}}, nil
+		phases.TotalMs = time.Since(t0).Milliseconds()
+		return []*PathResult{{GenerationStatus: "no-route", Timings: PathTimings{RouteMs: phases.TotalMs, Phases: &phases}}}, phases, nil
 	}
+	rankingStart := time.Now()
 	if len(best) < desiredK && len(fallback) > 0 {
 		sort.Slice(fallback, func(i, j int) bool { return fallback[i].score < fallback[j].score })
 		for _, c := range fallback {
@@ -545,11 +679,15 @@ searchPairs:
 			best = best[:desiredK]
 		}
 	}
+	phases.RankingMs = time.Since(rankingStart).Milliseconds()
+	phases.CandidatesFound = len(best)
+	phases.TotalMs = time.Since(t0).Milliseconds()
 	out := make([]*PathResult, 0, len(best))
 	for _, s := range best {
+		s.res.Timings = PathTimings{RouteMs: s.res.Timings.RouteMs, Phases: &phases}
 		out = append(out, s.res)
 	}
-	return out, nil
+	return out, phases, nil
 }
 
 func wayKey(wayIDs []int64) string {
@@ -588,6 +726,11 @@ func RouteWithConstraints(
 }
 
 func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate, error) {
+	cacheKey := routeKCacheKey{start: start, goal: goal, k: k, algo: algo}
+	if cached, ok := getRouteKFromCache(cacheKey); ok {
+		return cached, nil
+	}
+
 	k = maxInt(1, k)
 	t0 := time.Now()
 	firstNodes, firstDist, firstWays, firstEdges, firstStats, ok := RouteWithConstraints(g, start, goal, algo, nil, nil)
@@ -678,6 +821,7 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 	if len(best) > k {
 		best = best[:k]
 	}
+	putRouteKInCache(cacheKey, best)
 	return best, nil
 }
 
