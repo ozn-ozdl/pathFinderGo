@@ -8,7 +8,7 @@ import (
 type GridIndex struct {
 	cellDeg float64
 	cells   map[int64][]int // cellKey -> node indices
-	coords  [][2]float64
+	coords  [][2]float32
 	seen    []uint32
 	seenID  uint32
 }
@@ -23,7 +23,7 @@ func defaultGridCellSizeDeg() float64 {
 	return 0.01
 }
 
-func NewGridIndex(coords [][2]float64, cellDeg float64) *GridIndex {
+func NewGridIndex(coords [][2]float32, cellDeg float64) *GridIndex {
 	if cellDeg <= 0 {
 		cellDeg = defaultGridCellSizeDeg()
 	}
@@ -34,10 +34,10 @@ func NewGridIndex(coords [][2]float64, cellDeg float64) *GridIndex {
 		seen:    make([]uint32, len(coords)),
 	}
 	for i, c := range coords {
-		if math.IsNaN(c[0]) || math.IsNaN(c[1]) {
+		if math.IsNaN(float64(c[0])) || math.IsNaN(float64(c[1])) {
 			continue
 		}
-		key := g.keyFor(c[0], c[1])
+		key := g.keyFor(float64(c[0]), float64(c[1]))
 		g.cells[key] = append(g.cells[key], i)
 	}
 	return g
@@ -78,7 +78,7 @@ func (g *GridIndex) KNearest(lat, lon float64, k int) []Nearest {
 					}
 					g.seen[idx] = g.seenID
 					c := g.coords[idx]
-					d := haversineMeters(lat, lon, c[0], c[1])
+					d := haversineMeters(lat, lon, float64(c[0]), float64(c[1]))
 					out = append(out, Nearest{Node: idx, DistM: d})
 				}
 			}

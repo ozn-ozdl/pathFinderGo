@@ -33,7 +33,7 @@ type RailwayStation struct {
 	Type string            `json:"type"`
 	Lat  float64           `json:"lat"`
 	Lon  float64           `json:"lon"`
-	Tags map[string]string `json:"tags,omitempty"`
+	IFOPT string `json:"ifopt,omitempty"`
 }
 
 type RailwayLine struct {
@@ -41,12 +41,12 @@ type RailwayLine struct {
 	Name    string       `json:"name"`
 	Type    string       `json:"type"`
 	NodeIDs []osm.NodeID `json:"node_ids"`
+	MaxSpeedKPH float32  `json:"max_speed_kph,omitempty"`
 	// Coords is the ordered list of coordinates along the way, derived from NodeIDs.
 	Coords []struct {
 		Lat float64 `json:"lat"`
 		Lon float64 `json:"lon"`
 	} `json:"coords"`
-	Tags osm.Tags `json:"tags,omitempty"`
 }
 
 type RailwayData struct {
@@ -61,7 +61,7 @@ type Server struct {
 	mux        *http.ServeMux
 }
 
-const cacheSchemaVersion = "v3-filtered-rail-types"
+const cacheSchemaVersion = "v4-f32-compact"
 var allowedRailwayWayTypes = []string{"rail", "narrow_gauge", "monorail"}
 var allowedRailwayWayTypeSet = map[string]struct{}{
 	"rail":         {},
@@ -948,8 +948,8 @@ func canonicalStopKey(stop ResolvedStop) string {
 	if stop.InputID != "" {
 		return canonicalIFOPT(stop.InputID)
 	}
-	if stop.Station != nil && stop.Station.Tags != nil {
-		if v := strings.TrimSpace(stop.Station.Tags["ref:IFOPT"]); v != "" {
+	if stop.Station != nil {
+		if v := strings.TrimSpace(stop.Station.IFOPT); v != "" {
 			return canonicalIFOPT(v)
 		}
 	}
@@ -1365,14 +1365,13 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 			}
 			name := n.Tags.Find("name")
 			typ := stationTypeFromTags(n.Tags)
-			tags := tagsToMap(n.Tags)
 			stations[n.ID] = RailwayStation{
 				ID:   n.ID,
 				Name: name,
 				Type: typ,
 				Lat:  n.Lat,
 				Lon:  n.Lon,
-				Tags: tags,
+				IFOPT: strings.TrimSpace(n.Tags.Find("ref:IFOPT")),
 			}
 		case *osm.Way:
 			w := v
@@ -1381,6 +1380,7 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 			}
 			name := w.Tags.Find("name")
 			typ := wayTypeFromTags(w.Tags)
+			maxSpeedKPH := float32(wayRatedSpeedKPH(w.Tags, typ))
 
 			nodeIDs := make([]osm.NodeID, 0, len(w.Nodes))
 			for _, nd := range w.Nodes {
@@ -1392,7 +1392,7 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 				Type:    typ,
 				NodeIDs: nodeIDs,
 				Coords:  nil, // populated after scanning, once nodesByID is complete
-				Tags:    w.Tags,
+				MaxSpeedKPH: maxSpeedKPH,
 			}
 		}
 	}
@@ -1584,10 +1584,7 @@ func tagsToMap(tags osm.Tags) map[string]string {
 func buildIFOPTIndex(data RailwayData) map[string][]osm.NodeID {
 	idx := make(map[string][]osm.NodeID, len(data.StationsByID)/4+1)
 	for id, st := range data.StationsByID {
-		if st.Tags == nil {
-			continue
-		}
-		v := strings.TrimSpace(st.Tags["ref:IFOPT"])
+		v := strings.TrimSpace(st.IFOPT)
 		if v == "" {
 			continue
 		}
@@ -1702,6 +1699,72 @@ func parseFloat64(s string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+func wayRatedSpeedKPH(tags osm.Tags, railType string) float64 {
+	if tags == nil {
+		return ratedSpeedKPH(0, railTypeFromString(railType))
+	}
+	keys := []string{
+		"maxspeed",
+		"maxspeed:railway",
+		"railway:maxspeed",
+		"maxspeed:forward",
+		"maxspeed:backward",
+	}
+	best := 0.0
+	for _, key := range keys {
+		v := strings.TrimSpace(tags.Find(key))
+		if v == "" {
+			continue
+		}
+		sp := parseOSMSpeedKPH(v)
+		if sp > best {
+			best = sp
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	return ratedSpeedKPH(0, railTypeFromString(railType))
+}
+
+func parseOSMSpeedKPH(raw string) float64 {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	if v == "" {
+		return 0
+	}
+	// OSM can store combined values, e.g. "120;100 mph".
+	parts := strings.Split(v, ";")
+	best := 0.0
+	for _, p := range parts {
+		token := strings.TrimSpace(strings.ReplaceAll(p, ",", "."))
+		if token == "" {
+			continue
+		}
+		mult := 1.0 // kph
+		if strings.Contains(token, "mph") {
+			mult = 1.609344
+			token = strings.ReplaceAll(token, "mph", "")
+		}
+		token = strings.ReplaceAll(token, "km/h", "")
+		token = strings.ReplaceAll(token, "kmh", "")
+		token = strings.ReplaceAll(token, "kph", "")
+		token = strings.TrimSpace(token)
+		fields := strings.Fields(token)
+		if len(fields) > 0 {
+			token = fields[0]
+		}
+		num, err := strconv.ParseFloat(token, 64)
+		if err != nil || num <= 0 {
+			continue
+		}
+		kph := num * mult
+		if kph > best {
+			best = kph
+		}
+	}
+	return best
 }
 
 func fileSignature(path string) (string, error) {

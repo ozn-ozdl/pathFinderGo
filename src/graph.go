@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,17 +17,49 @@ import (
 	"github.com/paulmach/osm"
 )
 
+const (
+	railTypeUnknown uint8 = iota
+	railTypeHighSpeed
+	railTypeRail
+	railTypeLightRail
+	railTypeSubway
+	railTypeTram
+	railTypeMonorail
+	railTypeNarrowGauge
+)
+
+func railTypeFromString(s string) uint8 {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "high_speed":
+		return railTypeHighSpeed
+	case "rail":
+		return railTypeRail
+	case "light_rail":
+		return railTypeLightRail
+	case "subway":
+		return railTypeSubway
+	case "tram":
+		return railTypeTram
+	case "monorail":
+		return railTypeMonorail
+	case "narrow_gauge":
+		return railTypeNarrowGauge
+	default:
+		return railTypeUnknown
+	}
+}
+
 type Edge struct {
 	To          int
-	DistM       float64
+	DistM       float32
 	WayID       int64
-	RailType    string
-	MaxSpeedKPH float64
+	RailType    uint8
+	MaxSpeedKPH float32
 }
 
 type RailGraph struct {
 	NodeIDs     []int64
-	NodeCoords  [][2]float64 // index -> (lat, lon)
+	NodeCoords  [][2]float32 // index -> (lat, lon)
 	Adj         [][]Edge
 	IndexByNode map[int64]int
 
@@ -91,9 +122,9 @@ type topKScored struct {
 
 type routeEdgeMeta struct {
 	wayID       int64
-	railType    string
-	maxSpeedKPH float64
-	distM       float64
+	railType    uint8
+	maxSpeedKPH float32
+	distM       float32
 }
 
 type routeSearchState struct {
@@ -166,7 +197,7 @@ func putRouteKInCache(key routeKCacheKey, paths []routeCandidate) {
 
 type railGraphCache struct {
 	NodeIDs    []int64
-	NodeCoords [][2]float64
+	NodeCoords [][2]float32
 	Adj        [][]Edge
 }
 
@@ -267,13 +298,13 @@ func buildGraph(nodesByID map[osm.NodeID]*osm.Node, lines map[osm.WayID]RailwayL
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	indexByNode := make(map[int64]int, len(ids))
-	coords := make([][2]float64, len(ids))
+	coords := make([][2]float32, len(ids))
 	for i, id := range ids {
 		indexByNode[id] = i
 		if n, ok := nodesByID[osm.NodeID(id)]; ok {
-			coords[i] = [2]float64{n.Lat, n.Lon}
+			coords[i] = [2]float32{float32(n.Lat), float32(n.Lon)}
 		} else {
-			coords[i] = [2]float64{math.NaN(), math.NaN()}
+			coords[i] = [2]float32{float32(math.NaN()), float32(math.NaN())}
 		}
 	}
 
@@ -283,7 +314,8 @@ func buildGraph(nodesByID map[osm.NodeID]*osm.Node, lines map[osm.WayID]RailwayL
 		if len(ln.NodeIDs) < 2 {
 			continue
 		}
-		maxSpeedKPH := wayRatedSpeedKPH(ln.Tags, ln.Type)
+		maxSpeedKPH := ln.MaxSpeedKPH
+		rt := railTypeFromString(ln.Type)
 		for i := 0; i+1 < len(ln.NodeIDs); i++ {
 			aID := int64(ln.NodeIDs[i])
 			bID := int64(ln.NodeIDs[i+1])
@@ -294,16 +326,16 @@ func buildGraph(nodesByID map[osm.NodeID]*osm.Node, lines map[osm.WayID]RailwayL
 			}
 			lat1, lon1 := coords[a][0], coords[a][1]
 			lat2, lon2 := coords[b][0], coords[b][1]
-			if math.IsNaN(lat1) || math.IsNaN(lat2) {
+			if math.IsNaN(float64(lat1)) || math.IsNaN(float64(lat2)) {
 				continue
 			}
-			d := haversineMeters(lat1, lon1, lat2, lon2)
+			d := haversineMeters(float64(lat1), float64(lon1), float64(lat2), float64(lon2))
 			if d <= 0 {
 				continue
 			}
 			wid := int64(wayID)
-			adj[a] = append(adj[a], Edge{To: b, DistM: d, WayID: wid, RailType: ln.Type, MaxSpeedKPH: maxSpeedKPH})
-			adj[b] = append(adj[b], Edge{To: a, DistM: d, WayID: wid, RailType: ln.Type, MaxSpeedKPH: maxSpeedKPH})
+			adj[a] = append(adj[a], Edge{To: b, DistM: float32(d), WayID: wid, RailType: rt, MaxSpeedKPH: maxSpeedKPH})
+			adj[b] = append(adj[b], Edge{To: a, DistM: float32(d), WayID: wid, RailType: rt, MaxSpeedKPH: maxSpeedKPH})
 		}
 	}
 
@@ -372,9 +404,10 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 
 			coords := make([][2]float64, 0, len(pathIdx)+2)
 			coords = append(coords, fromLatLon)
-			for _, idx := range pathIdx {
-				coords = append(coords, g.NodeCoords[idx])
-			}
+				for _, idx := range pathIdx {
+					c := g.NodeCoords[idx]
+					coords = append(coords, [2]float64{float64(c[0]), float64(c[1])})
+				}
 			coords = append(coords, toLatLon)
 
 			bestCost = total
@@ -569,9 +602,10 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 
 			coords := make([][2]float64, 0, len(path.nodes)+2)
 			coords = append(coords, fromLatLon)
-			for _, idx := range path.nodes {
-				coords = append(coords, g.NodeCoords[idx])
-			}
+				for _, idx := range path.nodes {
+					c := g.NodeCoords[idx]
+					coords = append(coords, [2]float64{float64(c[0]), float64(c[1])})
+				}
 			coords = append(coords, toLatLon)
 
 			estSec := estimateTravelSeconds(path.path, starts[res.i].snap, goals[res.j].snap, useAccelDecel)
@@ -894,7 +928,7 @@ func routeWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edgeKey
 				continue
 			}
 			stats.Relaxed++
-			nd := curDist + e.DistM
+			nd := curDist + float64(e.DistM)
 			oldDist := math.Inf(1)
 			if state.nodeStamp[e.To] == state.epoch {
 				oldDist = state.dist[e.To]
@@ -1066,7 +1100,7 @@ func estimateTravelSeconds(pathEdges []routeEdgeMeta, snapFromMeters, snapToMete
 		prevSpeedKPH = speedKPH
 		havePrevSpeed = true
 		endSpeed = speedKPH
-		totalSec += e.distM / (speedKPH * 1000 / 3600)
+		totalSec += float64(e.distM) / (speedKPH * 1000 / 3600)
 	}
 	if useAccelDecel {
 		totalSec += transitionSec
@@ -1101,7 +1135,7 @@ func bestEdgeBetween(g *RailGraph, from, to int) (Edge, bool) {
 	if from < 0 || from >= len(g.Adj) {
 		return Edge{}, false
 	}
-	bestDist := math.Inf(1)
+	bestDist := float32(math.Inf(1))
 	var best Edge
 	found := false
 	for _, e := range g.Adj[from] {
@@ -1117,97 +1151,38 @@ func bestEdgeBetween(g *RailGraph, from, to int) (Edge, bool) {
 	return best, found
 }
 
-func ratedSpeedKPH(maxSpeedKPH float64, railType string) float64 {
+func ratedSpeedKPH(maxSpeedKPH float32, railType uint8) float64 {
 	if maxSpeedKPH > 0 {
-		return maxSpeedKPH
+		return float64(maxSpeedKPH)
 	}
 	switch railType {
-	case "high_speed":
+	case railTypeHighSpeed:
 		return 250
-	case "rail":
+	case railTypeRail:
 		return 120
-	case "light_rail":
+	case railTypeLightRail:
 		return 90
-	case "subway":
+	case railTypeSubway:
 		return 80
-	case "tram":
+	case railTypeTram:
 		return 50
-	case "monorail":
+	case railTypeMonorail:
 		return 70
-	case "narrow_gauge":
+	case railTypeNarrowGauge:
 		return 60
 	default:
 		return 100
 	}
 }
 
-func wayRatedSpeedKPH(tags osm.Tags, railType string) float64 {
-	if tags == nil {
-		return ratedSpeedKPH(0, railType)
-	}
-	keys := []string{
-		"maxspeed",
-		"maxspeed:railway",
-		"railway:maxspeed",
-		"maxspeed:forward",
-		"maxspeed:backward",
-	}
-	best := 0.0
-	for _, key := range keys {
-		v := strings.TrimSpace(tags.Find(key))
-		if v == "" {
-			continue
-		}
-		sp := parseOSMSpeedKPH(v)
-		if sp > best {
-			best = sp
-		}
-	}
-	return ratedSpeedKPH(best, railType)
-}
+// wayRatedSpeedKPH remains in server.go where OSM tags are parsed and reduced.
 
-func parseOSMSpeedKPH(raw string) float64 {
-	v := strings.ToLower(strings.TrimSpace(raw))
-	if v == "" {
-		return 0
-	}
-	// OSM can store combined values, e.g. "120;100 mph".
-	parts := strings.Split(v, ";")
-	best := 0.0
-	for _, p := range parts {
-		token := strings.TrimSpace(strings.ReplaceAll(p, ",", "."))
-		if token == "" {
-			continue
-		}
-		mult := 1.0 // kph
-		if strings.Contains(token, "mph") {
-			mult = 1.609344
-			token = strings.ReplaceAll(token, "mph", "")
-		}
-		token = strings.ReplaceAll(token, "km/h", "")
-		token = strings.ReplaceAll(token, "kmh", "")
-		token = strings.ReplaceAll(token, "kph", "")
-		token = strings.TrimSpace(token)
-		fields := strings.Fields(token)
-		if len(fields) > 0 {
-			token = fields[0]
-		}
-		num, err := strconv.ParseFloat(token, 64)
-		if err != nil || num <= 0 {
-			continue
-		}
-		kph := num * mult
-		if kph > best {
-			best = kph
-		}
-	}
-	return best
-}
+// parseOSMSpeedKPH is implemented in server.go (OSM parsing side).
 
 func heuristicM(g *RailGraph, a, b int) float64 {
 	la, lo := g.NodeCoords[a][0], g.NodeCoords[a][1]
 	lb, lob := g.NodeCoords[b][0], g.NodeCoords[b][1]
-	return haversineMeters(la, lo, lb, lob)
+	return haversineMeters(float64(la), float64(lo), float64(lb), float64(lob))
 }
 
 type pqItem struct {
@@ -1282,16 +1257,16 @@ func edgeDistance(g *RailGraph, from, to int) (float64, bool) {
 	if from < 0 || from >= len(g.Adj) {
 		return 0, false
 	}
-	best := math.Inf(1)
+	best := float32(math.Inf(1))
 	for _, e := range g.Adj[from] {
 		if e.To == to && e.DistM < best {
 			best = e.DistM
 		}
 	}
-	if math.IsInf(best, 1) {
+	if math.IsInf(float64(best), 1) {
 		return 0, false
 	}
-	return best, true
+	return float64(best), true
 }
 
 func pathToWayIDs(g *RailGraph, nodes []int) []int64 {
@@ -1302,7 +1277,7 @@ func pathToWayIDs(g *RailGraph, nodes []int) []int64 {
 	var last int64
 	for i := 1; i < len(nodes); i++ {
 		best := int64(0)
-		bestDist := math.Inf(1)
+		bestDist := float32(math.Inf(1))
 		u := nodes[i-1]
 		v := nodes[i]
 		for _, e := range g.Adj[u] {
@@ -1372,7 +1347,7 @@ func pathEdgeWayID(g *RailGraph, from, to int) (int64, bool) {
 		return 0, false
 	}
 	best := int64(0)
-	bestDist := math.Inf(1)
+	bestDist := float32(math.Inf(1))
 	for _, e := range g.Adj[from] {
 		if e.To != to {
 			continue
@@ -1382,7 +1357,7 @@ func pathEdgeWayID(g *RailGraph, from, to int) (int64, bool) {
 			best = e.WayID
 		}
 	}
-	if best == 0 || math.IsInf(bestDist, 1) {
+	if best == 0 || math.IsInf(float64(bestDist), 1) {
 		return 0, false
 	}
 	return best, true
@@ -1491,7 +1466,7 @@ func directionalPenaltyMeters(g *RailGraph, nodes []int, fromLatLon, toLatLon [2
 	for i := 0; i+1 < len(nodes); i++ {
 		a := g.NodeCoords[nodes[i]]
 		b := g.NodeCoords[nodes[i+1]]
-		vx, vy := approxPlanarDeltaMeters(a[0], a[1], b[0], b[1])
+		vx, vy := approxPlanarDeltaMeters(float64(a[0]), float64(a[1]), float64(b[0]), float64(b[1]))
 		segLen := math.Hypot(vx, vy)
 		if segLen <= 0 {
 			continue
