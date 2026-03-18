@@ -61,9 +61,17 @@ type Server struct {
 	mux        *http.ServeMux
 }
 
-const cacheSchemaVersion = "v2-speed-estimates"
+const cacheSchemaVersion = "v3-filtered-rail-types"
+var allowedRailwayWayTypes = []string{"rail", "narrow_gauge", "monorail"}
+var allowedRailwayWayTypeSet = map[string]struct{}{
+	"rail":         {},
+	"narrow_gauge": {},
+	"monorail":     {},
+}
 
 func main() {
+	loadEnvFile(".env")
+
 	defaultAddr := getEnv("SERVER_ADDR", ":8080")
 	defaultOSM := getOSMPath()
 
@@ -71,6 +79,7 @@ func main() {
 	osmPath := flag.String("osm", defaultOSM, "Path to OSM extract (.osm or .pbf) (or set OSM_FILE)")
 	flag.Parse()
 
+	log.Printf("active railway way types: %s", strings.Join(allowedRailwayWayTypes, ", "))
 	log.Printf("loading OSM file from %s", *osmPath)
 	data, graph, err := loadRailwayDataAndGraph(*osmPath)
 	if err != nil {
@@ -1317,7 +1326,7 @@ func hasRailwayStationTag(tags osm.Tags) bool {
 		return true
 	}
 	switch tags.Find("railway") {
-	case "halt", "stop", "yard", "junction", "subway_entrance":
+	case "halt", "stop", "junction":
 		return true
 	}
 	return false
@@ -1340,8 +1349,8 @@ func hasRailwayWayTag(tags osm.Tags) bool {
 	if tags == nil {
 		return false
 	}
-	switch tags.Find("railway") {
-	case "rail", "light_rail", "subway", "tram", "narrow_gauge", "monorail":
+	_, ok := allowedRailwayWayTypeSet[tags.Find("railway")]
+	if ok {
 		return true
 	}
 	return false
@@ -1367,6 +1376,35 @@ func getOSMPath() string {
 		return "data/map.osm"
 	}
 	return filepath.Join(wd, "data", "map.osm")
+}
+
+func loadEnvFile(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "export ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.Trim(parts[1], "\"'")
+		value = strings.TrimSpace(value)
+		if key == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, value)
+		}
+	}
 }
 
 func getEnv(key, def string) string {

@@ -9,6 +9,8 @@ type GridIndex struct {
 	cellDeg float64
 	cells   map[int64][]int // cellKey -> node indices
 	coords  [][2]float64
+	seen    []uint32
+	seenID  uint32
 }
 
 type Nearest struct {
@@ -29,6 +31,7 @@ func NewGridIndex(coords [][2]float64, cellDeg float64) *GridIndex {
 		cellDeg: cellDeg,
 		cells:   make(map[int64][]int, len(coords)/4+1),
 		coords:  coords,
+		seen:    make([]uint32, len(coords)),
 	}
 	for i, c := range coords {
 		if math.IsNaN(c[0]) || math.IsNaN(c[1]) {
@@ -51,7 +54,13 @@ func (g *GridIndex) KNearest(lat, lon float64, k int) []Nearest {
 	cx, cy := g.cellXY(lat, lon)
 	out := make([]Nearest, 0, k*3)
 
-	seen := make(map[int]struct{}, k*8)
+	g.seenID++
+	if g.seenID == 0 {
+		for i := range g.seen {
+			g.seen[i] = 0
+		}
+		g.seenID = 1
+	}
 
 	// Expand ring by ring of cells until we have enough candidates.
 	maxR := 12 // hard cap for worst-case; keeps snapping bounded.
@@ -64,10 +73,10 @@ func (g *GridIndex) KNearest(lat, lon float64, k int) []Nearest {
 				key := packCell(cx+dx, cy+dy)
 				nodes := g.cells[key]
 				for _, idx := range nodes {
-					if _, ok := seen[idx]; ok {
+					if g.seen[idx] == g.seenID {
 						continue
 					}
-					seen[idx] = struct{}{}
+					g.seen[idx] = g.seenID
 					c := g.coords[idx]
 					d := haversineMeters(lat, lon, c[0], c[1])
 					out = append(out, Nearest{Node: idx, DistM: d})
