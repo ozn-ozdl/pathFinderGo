@@ -1,1 +1,16 @@
-    
+.cache/
+data/
+*.osm
+*.pbf
+.env
+
+# Go
+bin/
+*.exe
+*.out
+*.test
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

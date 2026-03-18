@@ -1,0 +1,13 @@
+.git
+.github
+.cache
+data
+ui/node_modules
+ui/dist
+ui/.vite
+ui/.turbo
+ui/.next
+*.osm
+*.pbf
+.DS_Store
+
