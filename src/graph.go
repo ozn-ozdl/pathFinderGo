@@ -127,6 +127,12 @@ type routeEdgeMeta struct {
 	distM       float32
 }
 
+type PathEdgeProfile struct {
+	WayID       int64   `json:"way_id"`
+	DistM       float64 `json:"dist_m"`
+	MaxSpeedKPH float64 `json:"max_speed_kph"`
+}
+
 type routeSearchState struct {
 	dist      []float64
 	prev      []int
@@ -381,49 +387,90 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 	sort.Slice(starts, func(i, j int) bool { return starts[i].snap < starts[j].snap })
 	sort.Slice(goals, func(i, j int) bool { return goals[i].snap < goals[j].snap })
 
-	best := (*PathResult)(nil)
-	bestCost := math.Inf(1)
-
 	// Try a small cross-product of snap candidates (keeps it fast).
 	maxPairs := minInt(36, len(starts)*len(goals))
-	pairsTried := 0
-	for i := 0; i < len(starts) && pairsTried < maxPairs; i++ {
-		for j := 0; j < len(goals) && pairsTried < maxPairs; j++ {
-			pairsTried++
-			si := starts[i].idx
-			gi := goals[j].idx
+	type snapPair struct {
+		i, j int
+	}
+	pairs := make([]snapPair, 0, maxPairs)
+	for i := 0; i < len(starts) && len(pairs) < maxPairs; i++ {
+		for j := 0; j < len(goals) && len(pairs) < maxPairs; j++ {
+			pairs = append(pairs, snapPair{i: i, j: j})
+		}
+	}
 
-			pathIdx, distM, wayIDs, pathEdges, stats, ok := Route(g, si, gi, algo)
-			if !ok {
-				continue
-			}
-			total := distM + starts[i].snap + goals[j].snap
-			if total >= bestCost {
-				continue
-			}
+	pairResults := make([]*PathResult, len(pairs))
+	if len(pairs) == 0 {
+		return &PathResult{GenerationStatus: "no-route", Timings: PathTimings{RouteMs: time.Since(t0).Milliseconds()}}, nil
+	}
 
-			coords := make([][2]float64, 0, len(pathIdx)+2)
-			coords = append(coords, fromLatLon)
+	workerCount := runtime.GOMAXPROCS(0)
+	if workerCount > 8 {
+		workerCount = 8
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if len(pairs) < workerCount {
+		workerCount = len(pairs)
+	}
+
+	pairCh := make(chan int)
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			defer wg.Done()
+			for pi := range pairCh {
+				p := pairs[pi]
+				si := starts[p.i].idx
+				gi := goals[p.j].idx
+				pathIdx, distM, wayIDs, pathEdges, stats, ok := Route(g, si, gi, algo)
+				if !ok {
+					continue
+				}
+				total := distM + starts[p.i].snap + goals[p.j].snap
+				coords := make([][2]float64, 0, len(pathIdx)+2)
+				coords = append(coords, fromLatLon)
 				for _, idx := range pathIdx {
 					c := g.NodeCoords[idx]
 					coords = append(coords, [2]float64{float64(c[0]), float64(c[1])})
 				}
-			coords = append(coords, toLatLon)
-
-			bestCost = total
-			estSec := estimateTravelSeconds(pathEdges, starts[i].snap, goals[j].snap, useAccelDecel)
-			best = &PathResult{
-				Coords:             coords,
-				DistanceMeters:     total,
-				EstimatedTravelSec: estSec,
-				WayIDs:             wayIDs,
-				SnapFromMeters:     starts[i].snap,
-				SnapToMeters:       goals[j].snap,
-				VisitedNodes:       stats.Visited,
-				RelaxedEdges:       stats.Relaxed,
-				Algorithm:          algo,
-				GenerationStatus:   "ok",
+				coords = append(coords, toLatLon)
+				estSec := estimateTravelSeconds(pathEdges, starts[p.i].snap, goals[p.j].snap, useAccelDecel)
+				pairResults[pi] = &PathResult{
+					Coords:             coords,
+					DistanceMeters:     total,
+					EstimatedTravelSec: estSec,
+					WayIDs:             wayIDs,
+					PathEdgeProfiles:   buildPathEdgeProfiles(pathEdges),
+					SnapFromMeters:     starts[p.i].snap,
+					SnapToMeters:       goals[p.j].snap,
+					VisitedNodes:       stats.Visited,
+					RelaxedEdges:       stats.Relaxed,
+					Algorithm:          algo,
+					GenerationStatus:   "ok",
+				}
 			}
+		}()
+	}
+	go func() {
+		for pi := range pairs {
+			pairCh <- pi
+		}
+		close(pairCh)
+	}()
+	wg.Wait()
+
+	var best *PathResult
+	bestCost := math.Inf(1)
+	for _, r := range pairResults {
+		if r == nil {
+			continue
+		}
+		if r.DistanceMeters < bestCost {
+			bestCost = r.DistanceMeters
+			best = r
 		}
 	}
 
@@ -602,10 +649,10 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 
 			coords := make([][2]float64, 0, len(path.nodes)+2)
 			coords = append(coords, fromLatLon)
-				for _, idx := range path.nodes {
-					c := g.NodeCoords[idx]
-					coords = append(coords, [2]float64{float64(c[0]), float64(c[1])})
-				}
+			for _, idx := range path.nodes {
+				c := g.NodeCoords[idx]
+				coords = append(coords, [2]float64{float64(c[0]), float64(c[1])})
+			}
 			coords = append(coords, toLatLon)
 
 			estSec := estimateTravelSeconds(path.path, starts[res.i].snap, goals[res.j].snap, useAccelDecel)
@@ -628,6 +675,7 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 				DistanceMeters:     total,
 				EstimatedTravelSec: estSec,
 				WayIDs:             path.ways,
+				PathEdgeProfiles:   buildPathEdgeProfiles(path.path),
 				SnapFromMeters:     starts[res.i].snap,
 				SnapToMeters:       goals[res.j].snap,
 				VisitedNodes:       path.stats.Visited,
@@ -1111,6 +1159,22 @@ func estimateTravelSeconds(pathEdges []routeEdgeMeta, snapFromMeters, snapToMete
 	}
 	totalSec += (snapFromMeters + snapToMeters) / (terminalSpeed * 1000 / 3600)
 	return totalSec
+}
+
+func buildPathEdgeProfiles(pathEdges []routeEdgeMeta) []PathEdgeProfile {
+	if len(pathEdges) == 0 {
+		return nil
+	}
+	profiles := make([]PathEdgeProfile, 0, len(pathEdges))
+	for _, e := range pathEdges {
+		speedKPH := ratedSpeedKPH(e.maxSpeedKPH, e.railType)
+		profiles = append(profiles, PathEdgeProfile{
+			WayID:       e.wayID,
+			DistM:       float64(e.distM),
+			MaxSpeedKPH: speedKPH,
+		})
+	}
+	return profiles
 }
 
 func speedTransitionSeconds(fromKPH, toKPH float64) float64 {

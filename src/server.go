@@ -20,6 +20,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/paulmach/osm"
@@ -28,20 +30,28 @@ import (
 )
 
 type RailwayStation struct {
-	ID   osm.NodeID        `json:"id"`
-	Name string            `json:"name"`
-	Type string            `json:"type"`
-	Lat  float64           `json:"lat"`
-	Lon  float64           `json:"lon"`
-	IFOPT string `json:"ifopt,omitempty"`
+	ID    osm.NodeID `json:"id"`
+	Name  string     `json:"name"`
+	Type  string     `json:"type"`
+	Lat   float64    `json:"lat"`
+	Lon   float64    `json:"lon"`
+	IFOPT string     `json:"ifopt,omitempty"`
+}
+
+type RailwaySignal struct {
+	ID   osm.NodeID `json:"id"`
+	Name string     `json:"name"`
+	Type string     `json:"type"`
+	Lat  float64    `json:"lat"`
+	Lon  float64    `json:"lon"`
 }
 
 type RailwayLine struct {
-	ID      osm.WayID    `json:"id"`
-	Name    string       `json:"name"`
-	Type    string       `json:"type"`
-	NodeIDs []osm.NodeID `json:"node_ids"`
-	MaxSpeedKPH float32  `json:"max_speed_kph,omitempty"`
+	ID          osm.WayID    `json:"id"`
+	Name        string       `json:"name"`
+	Type        string       `json:"type"`
+	NodeIDs     []osm.NodeID `json:"node_ids"`
+	MaxSpeedKPH float32      `json:"max_speed_kph,omitempty"`
 	// Coords is the ordered list of coordinates along the way, derived from NodeIDs.
 	Coords []struct {
 		Lat float64 `json:"lat"`
@@ -52,6 +62,7 @@ type RailwayLine struct {
 type RailwayData struct {
 	StationsByID map[osm.NodeID]RailwayStation `json:"stations_by_id"`
 	LinesByID    map[osm.WayID]RailwayLine     `json:"lines_by_id"`
+	Signals      []RailwaySignal               `json:"signals"`
 }
 
 type Server struct {
@@ -62,6 +73,7 @@ type Server struct {
 }
 
 const cacheSchemaVersion = "v4-f32-compact"
+
 var allowedRailwayWayTypes = []string{"rail", "narrow_gauge", "monorail"}
 var allowedRailwayWayTypeSet = map[string]struct{}{
 	"rail":         {},
@@ -148,9 +160,9 @@ type RouteRequest struct {
 	// Optional corridor similarity threshold for filtering near-duplicate alternatives.
 	// Range: [0,1]. Higher values allow more similar alternatives.
 	CorridorSimilarityThreshold *float64 `json:"corridor_similarity_threshold"`
-	SnapK                     *int    `json:"snap_k"`
-	MaxPairs                  *int    `json:"max_pairs"`
-	SearchK                   *int    `json:"search_k"`
+	SnapK                       *int     `json:"snap_k"`
+	MaxPairs                    *int     `json:"max_pairs"`
+	SearchK                     *int     `json:"search_k"`
 }
 
 type RouteResponse struct {
@@ -166,14 +178,14 @@ type RouteResponse struct {
 }
 
 type RoutePhaseTimings struct {
-	KNearestMs      int64 `json:"k_nearest_ms"`
+	KNearestMs       int64 `json:"k_nearest_ms"`
 	PairGenerationMs int64 `json:"pair_generation_ms"`
-	SearchMs        int64 `json:"search_ms"`
-	RankingMs       int64 `json:"ranking_ms"`
-	TotalMs         int64 `json:"total_ms"`
-	PairsTried      int   `json:"pairs_tried,omitempty"`
-	RouteKCalls     int   `json:"routek_calls,omitempty"`
-	CandidatesFound int   `json:"candidates_found,omitempty"`
+	SearchMs         int64 `json:"search_ms"`
+	RankingMs        int64 `json:"ranking_ms"`
+	TotalMs          int64 `json:"total_ms"`
+	PairsTried       int   `json:"pairs_tried,omitempty"`
+	RouteKCalls      int   `json:"routek_calls,omitempty"`
+	CandidatesFound  int   `json:"candidates_found,omitempty"`
 }
 
 type TripPathsRequest struct {
@@ -195,10 +207,10 @@ type TripPathsRequest struct {
 	// For single-segment trips, this is used as the segment target if no legs match.
 	TargetTravelSec *float64 `json:"target_travel_sec"`
 	// Optional journey legs used to rank each segment by real-world scheduled time.
-	Legs []TripTimingLeg `json:"legs"`
-	SnapK     *int    `json:"snap_k"`
-	MaxPairs  *int    `json:"max_pairs"`
-	SearchK   *int    `json:"search_k"`
+	Legs     []TripTimingLeg `json:"legs"`
+	SnapK    *int            `json:"snap_k"`
+	MaxPairs *int            `json:"max_pairs"`
+	SearchK  *int            `json:"search_k"`
 }
 
 type TripTimingLeg struct {
@@ -243,9 +255,9 @@ func (r TripPathsRequest) UseAccelDecel() bool {
 }
 
 type routeSearchTuning struct {
-	SnapK     int
-	MaxPairs  int
-	SearchK   int
+	SnapK    int
+	MaxPairs int
+	SearchK  int
 }
 
 func routeSearchDefaults(k int) routeSearchTuning {
@@ -323,9 +335,9 @@ type SegmentPaths struct {
 }
 
 type SegmentTimings struct {
-	ResolveMs int64             `json:"resolve_ms"`
-	RouteMs   int64             `json:"route_ms"`
-	Phases   *RoutePhaseTimings `json:"phases,omitempty"`
+	ResolveMs int64              `json:"resolve_ms"`
+	RouteMs   int64              `json:"route_ms"`
+	Phases    *RoutePhaseTimings `json:"phases,omitempty"`
 }
 
 type TripPathsResponse struct {
@@ -554,109 +566,169 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 	log.Printf("[%s] request config k=%d algo=%s use_accel_decel=%t corridor_similarity_threshold=%.3f snap_k=%d max_pairs=%d search_k=%d", reqID, k, algo, useAccelDecel, corridorThreshold, routing.SnapK, routing.MaxPairs, routing.SearchK)
 
 	tResolve0 := time.Now()
-	stops := make([]ResolvedStop, 0, len(req.Stops))
-	unmatched := make([]ResolvedStop, 0)
+	nStopsReq := len(req.Stops)
+	type stopResolveOut struct {
+		rs        ResolvedStop
+		ok        bool
+		elapsedMs int64
+	}
+	resolveOut := make([]stopResolveOut, nStopsReq)
+	stopWorkers := runtime.GOMAXPROCS(0)
+	if stopWorkers > 8 {
+		stopWorkers = 8
+	}
+	if stopWorkers < 1 {
+		stopWorkers = 1
+	}
+	if nStopsReq < stopWorkers {
+		stopWorkers = nStopsReq
+	}
+	stopSem := make(chan struct{}, stopWorkers)
+	var stopWg sync.WaitGroup
+	for idx := 0; idx < nStopsReq; idx++ {
+		stopWg.Add(1)
+		idx := idx
+		go func() {
+			defer stopWg.Done()
+			stopSem <- struct{}{}
+			defer func() { <-stopSem }()
+			raw := req.Stops[idx]
+			tStopResolve := time.Now()
+			rs, ok := s.resolveTripStop(raw)
+			resolveOut[idx] = stopResolveOut{
+				rs:        rs,
+				ok:        ok,
+				elapsedMs: time.Since(tStopResolve).Milliseconds(),
+			}
+		}()
+	}
+	stopWg.Wait()
 
-	for _, raw := range req.Stops {
-		tStopResolve := time.Now()
-		rs, ok := s.resolveTripStop(raw)
-		if !ok {
-			unmatched = append(unmatched, rs)
+	stops := make([]ResolvedStop, nStopsReq)
+	unmatched := make([]ResolvedStop, 0)
+	for idx := 0; idx < nStopsReq; idx++ {
+		r := resolveOut[idx]
+		stops[idx] = r.rs
+		if !r.ok {
+			unmatched = append(unmatched, r.rs)
 		}
+		raw := req.Stops[idx]
 		log.Printf(
 			"[%s] stop resolved matched=%t input=%s result=%s elapsed_ms=%d",
 			reqID,
-			ok,
+			r.ok,
 			describeTripStopRaw(raw),
-			describeResolvedStop(rs),
-			time.Since(tStopResolve).Milliseconds(),
+			describeResolvedStop(r.rs),
+			r.elapsedMs,
 		)
-		stops = append(stops, rs)
 	}
 	resolveMs := time.Since(tResolve0).Milliseconds()
 	log.Printf("[%s] resolved stops=%d unmatched=%d resolve_ms=%d", reqID, len(stops), len(unmatched), resolveMs)
 
+	nSeg := len(stops) - 1
+	segments := make([]SegmentPaths, nSeg)
 	var totalRouteMs int64
-	segments := make([]SegmentPaths, 0, len(stops)-1)
-	for i := 0; i+1 < len(stops); i++ {
-		segResolve0 := time.Now()
-		a := stops[i]
-		b := stops[i+1]
-		seg := SegmentPaths{From: a, To: b, TopK: nil, Timings: SegmentTimings{}}
-		seg.Timings.ResolveMs = time.Since(segResolve0).Milliseconds()
-		log.Printf("[%s] segment %d resolve_ms=%d", reqID, i, seg.Timings.ResolveMs)
-		aCoord, aHasCoord := stopCoords(a)
-		bCoord, bHasCoord := stopCoords(b)
-		if a.Matched && b.Matched && aHasCoord && bHasCoord {
-			segRoute0 := time.Now()
-			start := aCoord
-			goal := bCoord
-			log.Printf("[%s] segment %d routing start latlon=(%.6f,%.6f)->(%.6f,%.6f)", reqID, i, start[0], start[1], goal[0], goal[1])
-			targetSec, hasTarget := segmentTargetTravelSeconds(req, a, b, len(stops)-1)
-			// Over-generate for ranking when we have a schedule target, so the
-			// ranker can surface realistic but slightly longer routes.
-			searchK := k
-			if hasTarget && searchK < 8 {
-				searchK = 8
-			}
-			routeTuning := resolveTopKTuning(searchK, req.SnapK, req.MaxPairs, req.SearchK)
-			topk, routeTimings, routeErr := RouteStationsTopK(s.graph, start, goal, TopKOptions{
-				K:                           searchK,
-				SnapK:                       routeTuning.SnapK,
-				MaxPairs:                    routeTuning.MaxPairs,
-				SearchK:                     routeTuning.SearchK,
-				Algorithm:                   algo,
-				UseAccelDecel:               useAccelDecel,
-				CorridorSimilarityThreshold: corridorThreshold,
-				TargetTravelSec:             targetSec,
-			})
-			if routeErr != nil {
-				log.Printf("[%s] segment %d route error: %v", reqID, i, routeErr)
-			}
-			for _, candidate := range topk {
-				if candidate != nil {
-					candidate.Timings.Phases = &routeTimings
-				}
-			}
-			seg.TopK = topk
-			if hasTarget {
-				rankTopKByTargetTravelTime(seg.TopK, targetSec)
-			}
-			annotateTopKRanking(seg.TopK, targetSec, hasTarget)
-			if len(seg.TopK) > k {
-				seg.TopK = seg.TopK[:k]
-			}
-			seg.Timings.RouteMs = time.Since(segRoute0).Milliseconds()
-			if routeTimings.TotalMs > 0 {
-				seg.Timings.RouteMs = routeTimings.TotalMs
-			}
-			seg.Timings.Phases = &routeTimings
-			totalRouteMs += seg.Timings.RouteMs
-			best := "none"
-			if len(topk) > 0 {
-				best = topk[0].GenerationStatus
-			}
-			log.Printf(
-				"[%s] segment %d route_ms=%d topk=%d best_status=%s",
-				reqID,
-				i,
-				seg.Timings.RouteMs,
-				len(topk),
-				best,
-			)
-		} else {
-			log.Printf(
-				"[%s] segment %d skipped route (from matched=%t coord=%t, to matched=%t coord=%t)",
-				reqID,
-				i,
-				a.Matched,
-				aHasCoord,
-				b.Matched,
-				bHasCoord,
-			)
-		}
-		segments = append(segments, seg)
+	segWorkers := runtime.GOMAXPROCS(0)
+	if segWorkers > 8 {
+		segWorkers = 8
 	}
+	if segWorkers < 1 {
+		segWorkers = 1
+	}
+	if nSeg < segWorkers {
+		segWorkers = nSeg
+	}
+	segSem := make(chan struct{}, segWorkers)
+	var segWg sync.WaitGroup
+	for i := 0; i < nSeg; i++ {
+		segWg.Add(1)
+		i := i
+		go func() {
+			defer segWg.Done()
+			segSem <- struct{}{}
+			defer func() { <-segSem }()
+
+			segResolve0 := time.Now()
+			a := stops[i]
+			b := stops[i+1]
+			seg := SegmentPaths{From: a, To: b, TopK: nil, Timings: SegmentTimings{}}
+			seg.Timings.ResolveMs = time.Since(segResolve0).Milliseconds()
+			log.Printf("[%s] segment %d resolve_ms=%d", reqID, i, seg.Timings.ResolveMs)
+			aCoord, aHasCoord := stopCoords(a)
+			bCoord, bHasCoord := stopCoords(b)
+			if a.Matched && b.Matched && aHasCoord && bHasCoord {
+				segRoute0 := time.Now()
+				start := aCoord
+				goal := bCoord
+				log.Printf("[%s] segment %d routing start latlon=(%.6f,%.6f)->(%.6f,%.6f)", reqID, i, start[0], start[1], goal[0], goal[1])
+				targetSec, hasTarget := segmentTargetTravelSeconds(req, a, b, len(stops)-1)
+				// Over-generate for ranking when we have a schedule target, so the
+				// ranker can surface realistic but slightly longer routes.
+				searchK := k
+				if hasTarget && searchK < 8 {
+					searchK = 8
+				}
+				routeTuning := resolveTopKTuning(searchK, req.SnapK, req.MaxPairs, req.SearchK)
+				topk, routeTimings, routeErr := RouteStationsTopK(s.graph, start, goal, TopKOptions{
+					K:                           searchK,
+					SnapK:                       routeTuning.SnapK,
+					MaxPairs:                    routeTuning.MaxPairs,
+					SearchK:                     routeTuning.SearchK,
+					Algorithm:                   algo,
+					UseAccelDecel:               useAccelDecel,
+					CorridorSimilarityThreshold: corridorThreshold,
+					TargetTravelSec:             targetSec,
+				})
+				if routeErr != nil {
+					log.Printf("[%s] segment %d route error: %v", reqID, i, routeErr)
+				}
+				for _, candidate := range topk {
+					if candidate != nil {
+						candidate.Timings.Phases = &routeTimings
+						s.enrichPathResultWithRailwayHints(candidate)
+					}
+				}
+				seg.TopK = topk
+				if hasTarget {
+					rankTopKByTargetTravelTime(seg.TopK, targetSec)
+				}
+				annotateTopKRanking(seg.TopK, targetSec, hasTarget)
+				if len(seg.TopK) > k {
+					seg.TopK = seg.TopK[:k]
+				}
+				seg.Timings.RouteMs = time.Since(segRoute0).Milliseconds()
+				if routeTimings.TotalMs > 0 {
+					seg.Timings.RouteMs = routeTimings.TotalMs
+				}
+				seg.Timings.Phases = &routeTimings
+				atomic.AddInt64(&totalRouteMs, seg.Timings.RouteMs)
+				best := "none"
+				if len(topk) > 0 {
+					best = topk[0].GenerationStatus
+				}
+				log.Printf(
+					"[%s] segment %d route_ms=%d topk=%d best_status=%s",
+					reqID,
+					i,
+					seg.Timings.RouteMs,
+					len(topk),
+					best,
+				)
+			} else {
+				log.Printf(
+					"[%s] segment %d skipped route (from matched=%t coord=%t, to matched=%t coord=%t)",
+					reqID,
+					i,
+					a.Matched,
+					aHasCoord,
+					b.Matched,
+					bHasCoord,
+				)
+			}
+			segments[i] = seg
+		}()
+	}
+	segWg.Wait()
 
 	resp := TripPathsResponse{
 		K:         k,
@@ -1002,19 +1074,37 @@ func (s *Server) handleLines(w http.ResponseWriter, r *http.Request) {
 }
 
 type PathResult struct {
-	Rank               int          `json:"rank,omitempty"`
-	Ranking            *PathRanking `json:"ranking,omitempty"`
-	Coords             [][2]float64 `json:"coords"`
-	DistanceMeters     float64      `json:"distance_meters"`
-	EstimatedTravelSec float64      `json:"estimated_travel_sec"`
-	WayIDs             []int64      `json:"way_ids"`
-	SnapFromMeters     float64      `json:"snap_from_meters"`
-	SnapToMeters       float64      `json:"snap_to_meters"`
-	VisitedNodes       int          `json:"visited_nodes"`
-	RelaxedEdges       int          `json:"relaxed_edges"`
-	Algorithm          string       `json:"algorithm"`
-	GenerationStatus   string       `json:"generation_status"`
-	Timings            PathTimings  `json:"timings"`
+	Rank               int               `json:"rank,omitempty"`
+	Ranking            *PathRanking      `json:"ranking,omitempty"`
+	Coords             [][2]float64      `json:"coords"`
+	DistanceMeters     float64           `json:"distance_meters"`
+	EstimatedTravelSec float64           `json:"estimated_travel_sec"`
+	WayIDs             []int64           `json:"way_ids"`
+	PathEdgeProfiles   []PathEdgeProfile `json:"path_edge_profiles,omitempty"`
+	VmaxProfile        []PathVmaxPoint   `json:"vmax_profile,omitempty"`
+	Signals            []PathSignal      `json:"signals,omitempty"`
+	SnapFromMeters     float64           `json:"snap_from_meters"`
+	SnapToMeters       float64           `json:"snap_to_meters"`
+	VisitedNodes       int               `json:"visited_nodes"`
+	RelaxedEdges       int               `json:"relaxed_edges"`
+	Algorithm          string            `json:"algorithm"`
+	GenerationStatus   string            `json:"generation_status"`
+	Timings            PathTimings       `json:"timings"`
+}
+
+type PathVmaxPoint struct {
+	DistanceMeters float64 `json:"distance_meters"`
+	MaxSpeedKPH    float64 `json:"max_speed_kph"`
+	WayID          int64   `json:"way_id,omitempty"`
+}
+
+type PathSignal struct {
+	OSMNodeID      int64   `json:"osm_node_id"`
+	Name           string  `json:"name,omitempty"`
+	Type           string  `json:"type,omitempty"`
+	Lat            float64 `json:"lat"`
+	Lon            float64 `json:"lon"`
+	DistanceMeters float64 `json:"distance_meters"`
 }
 
 type PathRanking struct {
@@ -1025,8 +1115,8 @@ type PathRanking struct {
 }
 
 type PathTimings struct {
-	RouteMs int64             `json:"route_ms"`
-	Phases *RoutePhaseTimings `json:"phases,omitempty"`
+	RouteMs int64              `json:"route_ms"`
+	Phases  *RoutePhaseTimings `json:"phases,omitempty"`
 }
 
 func annotateTopKRanking(topk []*PathResult, targetSec float64, hasTarget bool) {
@@ -1047,6 +1137,138 @@ func annotateTopKRanking(topk []*PathResult, targetSec float64, hasTarget bool) 
 			UnderTarget:     est <= targetSec,
 		}
 	}
+}
+
+func (s *Server) enrichPathResultWithRailwayHints(result *PathResult) {
+	if result == nil {
+		return
+	}
+	result.VmaxProfile = buildPathVmaxProfile(result.PathEdgeProfiles, result.SnapFromMeters, result.SnapToMeters)
+	result.Signals = nil
+
+	if len(result.Coords) > 1 && len(s.data.Signals) > 0 {
+		result.Signals = extractRouteSignals(result.Coords, s.data.Signals)
+	}
+}
+
+func buildPathVmaxProfile(pathEdgeProfiles []PathEdgeProfile, snapFromMeters, snapToMeters float64) []PathVmaxPoint {
+	if len(pathEdgeProfiles) == 0 {
+		return nil
+	}
+	if snapFromMeters < 0 {
+		snapFromMeters = 0
+	}
+	if snapToMeters < 0 {
+		snapToMeters = 0
+	}
+
+	out := make([]PathVmaxPoint, 0, len(pathEdgeProfiles)+2)
+	current := pathEdgeProfiles[0].MaxSpeedKPH
+	if current <= 0 {
+		current = 100
+	}
+	out = append(out, PathVmaxPoint{
+		DistanceMeters: 0,
+		MaxSpeedKPH:    current,
+		WayID:          pathEdgeProfiles[0].WayID,
+	})
+
+	distanceMeters := snapFromMeters
+	for _, profile := range pathEdgeProfiles {
+		distanceMeters += profile.DistM
+		speedKPH := profile.MaxSpeedKPH
+		if speedKPH <= 0 {
+			speedKPH = current
+		}
+		if speedKPH != current {
+			out = append(out, PathVmaxPoint{
+				DistanceMeters: distanceMeters,
+				MaxSpeedKPH:    speedKPH,
+				WayID:          profile.WayID,
+			})
+			current = speedKPH
+		}
+	}
+
+	totalDistance := distanceMeters + snapToMeters
+	if len(out) > 0 && totalDistance > out[len(out)-1].DistanceMeters {
+		out = append(out, PathVmaxPoint{
+			DistanceMeters: totalDistance,
+			MaxSpeedKPH:    current,
+			WayID:          pathEdgeProfiles[len(pathEdgeProfiles)-1].WayID,
+		})
+	}
+
+	return out
+}
+
+func extractRouteSignals(coords [][2]float64, railSignals []RailwaySignal) []PathSignal {
+	if len(coords) < 2 || len(railSignals) == 0 {
+		return nil
+	}
+
+	prefixDistance := make([]float64, len(coords))
+	for i := 1; i < len(coords); i++ {
+		prefixDistance[i] = prefixDistance[i-1] + haversineMeters(
+			coords[i-1][0], coords[i-1][1],
+			coords[i][0], coords[i][1],
+		)
+	}
+
+	const toleranceMeters = 120.0
+	signalCandidates := make([]PathSignal, 0)
+	for _, signal := range railSignals {
+		closestIdx := -1
+		closestDist := math.Inf(1)
+		for idx, coord := range coords {
+			dist := haversineMeters(coord[0], coord[1], signal.Lat, signal.Lon)
+			if dist < closestDist {
+				closestDist = dist
+				closestIdx = idx
+			}
+		}
+		if closestIdx < 0 || closestDist > toleranceMeters {
+			continue
+		}
+		if closestIdx >= len(prefixDistance) {
+			continue
+		}
+		signalCandidates = append(signalCandidates, PathSignal{
+			OSMNodeID:      int64(signal.ID),
+			Name:           signal.Name,
+			Type:           signal.Type,
+			Lat:            signal.Lat,
+			Lon:            signal.Lon,
+			DistanceMeters: prefixDistance[closestIdx],
+		})
+	}
+
+	if len(signalCandidates) == 0 {
+		return nil
+	}
+
+	sort.Slice(signalCandidates, func(i, j int) bool {
+		if signalCandidates[i].DistanceMeters == signalCandidates[j].DistanceMeters {
+			return signalCandidates[i].OSMNodeID < signalCandidates[j].OSMNodeID
+		}
+		return signalCandidates[i].DistanceMeters < signalCandidates[j].DistanceMeters
+	})
+
+	// Drop near-duplicate picks that map to almost same location.
+	const dedupeMeters = 2.0
+	filtered := make([]PathSignal, 0, len(signalCandidates))
+	for _, signal := range signalCandidates {
+		if len(filtered) == 0 {
+			filtered = append(filtered, signal)
+			continue
+		}
+		last := filtered[len(filtered)-1]
+		if math.Abs(signal.DistanceMeters-last.DistanceMeters) <= dedupeMeters {
+			continue
+		}
+		filtered = append(filtered, signal)
+	}
+	return filtered
 }
 
 func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
@@ -1239,6 +1461,7 @@ func (s *Server) handleRouteV1(w http.ResponseWriter, r *http.Request) {
 	for _, candidate := range topk {
 		if candidate != nil {
 			candidate.Timings.Phases = &routeTimings
+			s.enrichPathResultWithRailwayHints(candidate)
 		}
 	}
 
@@ -1351,6 +1574,7 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 
 	stations := make(map[osm.NodeID]RailwayStation)
 	lines := make(map[osm.WayID]RailwayLine)
+	signals := make([]RailwaySignal, 0)
 	nodesByID := make(map[osm.NodeID]*osm.Node)
 
 	for scanner.Scan() {
@@ -1361,16 +1585,25 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 			nodesByID[n.ID] = n
 
 			if !hasRailwayStationTag(n.Tags) {
+				if hasRailwaySignalTag(n.Tags) {
+					signals = append(signals, RailwaySignal{
+						ID:   n.ID,
+						Name: strings.TrimSpace(n.Tags.Find("name")),
+						Type: strings.TrimSpace(n.Tags.Find("railway")),
+						Lat:  n.Lat,
+						Lon:  n.Lon,
+					})
+				}
 				continue
 			}
 			name := n.Tags.Find("name")
 			typ := stationTypeFromTags(n.Tags)
 			stations[n.ID] = RailwayStation{
-				ID:   n.ID,
-				Name: name,
-				Type: typ,
-				Lat:  n.Lat,
-				Lon:  n.Lon,
+				ID:    n.ID,
+				Name:  name,
+				Type:  typ,
+				Lat:   n.Lat,
+				Lon:   n.Lon,
 				IFOPT: strings.TrimSpace(n.Tags.Find("ref:IFOPT")),
 			}
 		case *osm.Way:
@@ -1387,11 +1620,11 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 				nodeIDs = append(nodeIDs, nd.ID)
 			}
 			lines[w.ID] = RailwayLine{
-				ID:      w.ID,
-				Name:    name,
-				Type:    typ,
-				NodeIDs: nodeIDs,
-				Coords:  nil, // populated after scanning, once nodesByID is complete
+				ID:          w.ID,
+				Name:        name,
+				Type:        typ,
+				NodeIDs:     nodeIDs,
+				Coords:      nil, // populated after scanning, once nodesByID is complete
 				MaxSpeedKPH: maxSpeedKPH,
 			}
 		}
@@ -1420,6 +1653,7 @@ func parseRailwayData(path string) (RailwayData, map[osm.NodeID]*osm.Node, map[o
 	data := RailwayData{
 		StationsByID: stations,
 		LinesByID:    lines,
+		Signals:      signals,
 	}
 	return data, nodesByID, lines, nil
 }
@@ -1494,6 +1728,20 @@ func hasRailwayWayTag(tags osm.Tags) bool {
 		return true
 	}
 	return false
+}
+
+func hasRailwaySignalTag(tags osm.Tags) bool {
+	if tags == nil {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(tags.Find("railway")))
+	if v == "" {
+		return strings.TrimSpace(strings.ToLower(tags.Find("railway:signal"))) != ""
+	}
+	if v != "signal" && v != "buffer_stop" {
+		return false
+	}
+	return true
 }
 
 func wayTypeFromTags(tags osm.Tags) string {
