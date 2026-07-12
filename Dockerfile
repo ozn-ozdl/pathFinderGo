@@ -7,7 +7,12 @@ RUN go mod download
 COPY ./src ./src
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/pathfindergo ./src
 
-FROM gcr.io/distroless/base-debian12:nonroot
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY --from=build /out/pathfindergo /app/pathfindergo
@@ -18,4 +23,3 @@ EXPOSE 8080
 # docker run --rm -p 8080:8080 -v "$PWD/data:/data" <image> \
 #   -addr :8080 -osm /data/map.osm
 ENTRYPOINT ["/app/pathfindergo"]
-
