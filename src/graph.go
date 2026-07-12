@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/heap"
+	"context"
 	"encoding/gob"
 	"fmt"
 	"log"
@@ -69,6 +70,7 @@ type RailGraph struct {
 type RouteOptions struct {
 	K         int
 	Algorithm string // "astar" or "dijkstra"
+	Context   context.Context
 	// If true, include acceleration/deceleration penalties between speed changes.
 	UseAccelDecel bool
 }
@@ -78,6 +80,7 @@ type TopKOptions struct {
 	SnapK     int
 	MaxPairs  int
 	Algorithm string
+	Context   context.Context
 	// If true, include acceleration/deceleration penalties between speed changes.
 	UseAccelDecel bool
 	// CorridorSimilarityThreshold controls how similar two routes can be before being
@@ -357,6 +360,10 @@ func buildGraph(nodesByID map[osm.NodeID]*osm.Node, lines map[osm.WayID]RailwayL
 
 func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptions) (*PathResult, error) {
 	t0 := time.Now()
+	ctx := opt.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if opt.K <= 0 {
 		opt.K = 6
 	}
@@ -422,10 +429,16 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 		go func() {
 			defer wg.Done()
 			for pi := range pairCh {
+				if err := ctx.Err(); err != nil {
+					return
+				}
 				p := pairs[pi]
 				si := starts[p.i].idx
 				gi := goals[p.j].idx
-				pathIdx, distM, wayIDs, pathEdges, stats, ok := Route(g, si, gi, algo)
+				pathIdx, distM, wayIDs, pathEdges, stats, ok, err := RouteContext(ctx, g, si, gi, algo)
+				if err != nil {
+					return
+				}
 				if !ok {
 					continue
 				}
@@ -456,11 +469,19 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 	}
 	go func() {
 		for pi := range pairs {
-			pairCh <- pi
+			select {
+			case pairCh <- pi:
+			case <-ctx.Done():
+				close(pairCh)
+				return
+			}
 		}
 		close(pairCh)
 	}()
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	var best *PathResult
 	bestCost := math.Inf(1)
@@ -483,6 +504,10 @@ func RouteStations(g *RailGraph, fromLatLon, toLatLon [2]float64, opt RouteOptio
 
 func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOptions) ([]*PathResult, RoutePhaseTimings, error) {
 	t0 := time.Now()
+	ctx := opt.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	phases := RoutePhaseTimings{}
 	desiredK := opt.K
 	if desiredK <= 0 {
@@ -599,16 +624,27 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 		go func() {
 			defer wg.Done()
 			for p := range pairCh {
+				if ctx.Err() != nil {
+					return
+				}
 				si := starts[p.i].idx
 				gi := goals[p.j].idx
 				searchStart := time.Now()
-				paths, _ := RouteK(g, si, gi, algo, searchK)
+				paths, err := RouteKContext(ctx, g, si, gi, algo, searchK)
+				if err != nil {
+					return
+				}
 				elapsed := time.Since(searchStart).Milliseconds()
-				resultCh <- pairResult{
+				result := pairResult{
 					i:         p.i,
 					j:         p.j,
 					paths:     paths,
 					elapsedMs: elapsed,
+				}
+				select {
+				case resultCh <- result:
+				case <-ctx.Done():
+					return
 				}
 			}
 		}()
@@ -616,16 +652,22 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 
 	pairsTried := 0
 	go func() {
+		defer close(pairCh)
 		for i := 0; i < len(starts) && pairsTried < maxPairs; i++ {
 			for j := 0; j < len(goals) && pairsTried < maxPairs; j++ {
-				pairsTried++
-				pairCh <- pair{i: i, j: j}
+				select {
+				case pairCh <- pair{i: i, j: j}:
+					pairsTried++
+				case <-ctx.Done():
+					return
+				}
 				if pairsTried >= maxPairs {
 					break
 				}
 			}
 		}
-		close(pairCh)
+	}()
+	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
@@ -698,6 +740,9 @@ func RouteStationsTopK(g *RailGraph, fromLatLon, toLatLon [2]float64, opt TopKOp
 				best = best[:desiredK]
 			}
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, phases, err
 	}
 	phases.RouteKCalls += pairsTried
 	phases.PairsTried = pairsTried
@@ -791,6 +836,10 @@ func Route(g *RailGraph, start, goal int, algo string) ([]int, float64, []int64,
 	return RouteWithConstraints(g, start, goal, algo, nil, nil)
 }
 
+func RouteContext(ctx context.Context, g *RailGraph, start, goal int, algo string) ([]int, float64, []int64, []routeEdgeMeta, RouteStats, bool, error) {
+	return routeWithConstraintsContext(ctx, g, start, goal, nil, nil, algo != "dijkstra")
+}
+
 func RouteWithConstraints(
 	g *RailGraph,
 	start,
@@ -799,15 +848,21 @@ func RouteWithConstraints(
 	bannedEdges map[edgeKey]struct{},
 	bannedNodes map[int]struct{},
 ) ([]int, float64, []int64, []routeEdgeMeta, RouteStats, bool) {
-	switch algo {
-	case "dijkstra":
-		return dijkstraWithConstraints(g, start, goal, bannedEdges, bannedNodes)
-	default:
-		return astarWithConstraints(g, start, goal, bannedEdges, bannedNodes)
-	}
+	path, dist, ways, edges, stats, ok, _ := routeWithConstraintsContext(context.Background(), g, start, goal, bannedEdges, bannedNodes, algo != "dijkstra")
+	return path, dist, ways, edges, stats, ok
 }
 
 func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate, error) {
+	return RouteKContext(context.Background(), g, start, goal, algo, k)
+}
+
+func RouteKContext(ctx context.Context, g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	cacheKey := routeKCacheKey{start: start, goal: goal, k: k, algo: algo}
 	if cached, ok := getRouteKFromCache(cacheKey); ok {
 		return cached, nil
@@ -815,7 +870,10 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 
 	k = maxInt(1, k)
 	t0 := time.Now()
-	firstNodes, firstDist, firstWays, firstEdges, firstStats, ok := RouteWithConstraints(g, start, goal, algo, nil, nil)
+	firstNodes, firstDist, firstWays, firstEdges, firstStats, ok, err := routeWithConstraintsContext(ctx, g, start, goal, nil, nil, algo != "dijkstra")
+	if err != nil {
+		return nil, err
+	}
 	if !ok {
 		return nil, nil
 	}
@@ -836,6 +894,9 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 
 	// 1) Corridor-span bans from baseline route.
 	for _, span := range corridorSpansFromPath(firstNodes, best[0].path, minInt(6, k*3)) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(best) >= k {
 			break
 		}
@@ -845,7 +906,10 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 			bannedEdges[edgeKey{from: e.to, to: e.from}] = struct{}{}
 		}
 		rt0 := time.Now()
-		altNodes, altDist, altWays, altEdges, altStats, altOk := RouteWithConstraints(g, start, goal, algo, bannedEdges, nil)
+		altNodes, altDist, altWays, altEdges, altStats, altOk, err := routeWithConstraintsContext(ctx, g, start, goal, bannedEdges, nil, algo != "dijkstra")
+		if err != nil {
+			return nil, err
+		}
 		if !altOk || len(altNodes) == 0 {
 			continue
 		}
@@ -868,6 +932,9 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 	// 2) If still missing alternatives, perturb windows on current best path.
 	if len(best) < k {
 		for _, window := range diversionWindows(firstNodes, minInt(8, k*4)) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
 			if len(best) >= k {
 				break
 			}
@@ -879,7 +946,10 @@ func RouteK(g *RailGraph, start, goal int, algo string, k int) ([]routeCandidate
 				bannedEdges[edgeKey{from: v, to: u}] = struct{}{}
 			}
 			rt0 := time.Now()
-			altNodes, altDist, altWays, altEdges, altStats, altOk := RouteWithConstraints(g, start, goal, algo, bannedEdges, nil)
+			altNodes, altDist, altWays, altEdges, altStats, altOk, err := routeWithConstraintsContext(ctx, g, start, goal, bannedEdges, nil, algo != "dijkstra")
+			if err != nil {
+				return nil, err
+			}
 			if !altOk || len(altNodes) == 0 {
 				continue
 			}
@@ -926,8 +996,16 @@ func dijkstraWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edge
 }
 
 func routeWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edgeKey]struct{}, bannedNodes map[int]struct{}, useHeuristic bool) ([]int, float64, []int64, []routeEdgeMeta, RouteStats, bool) {
+	path, dist, ways, edges, stats, ok, _ := routeWithConstraintsContext(context.Background(), g, start, goal, bannedEdges, bannedNodes, useHeuristic)
+	return path, dist, ways, edges, stats, ok
+}
+
+func routeWithConstraintsContext(ctx context.Context, g *RailGraph, start, goal int, bannedEdges map[edgeKey]struct{}, bannedNodes map[int]struct{}, useHeuristic bool) ([]int, float64, []int64, []routeEdgeMeta, RouteStats, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if start < 0 || goal < 0 || start >= len(g.NodeCoords) || goal >= len(g.NodeCoords) {
-		return nil, 0, nil, nil, RouteStats{}, false
+		return nil, 0, nil, nil, RouteStats{}, false, nil
 	}
 
 	state := acquireRouteSearchState(len(g.NodeCoords))
@@ -937,7 +1015,7 @@ func routeWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edgeKey
 	heap.Init(&state.pq)
 
 	if _, blocked := bannedNodes[start]; blocked {
-		return nil, 0, nil, nil, RouteStats{}, false
+		return nil, 0, nil, nil, RouteStats{}, false, nil
 	}
 	state.nodeStamp[start] = state.epoch
 	state.dist[start] = 0
@@ -950,7 +1028,14 @@ func routeWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edgeKey
 	heap.Push(&state.pq, &pqItem{Node: start, Priority: initialPriority})
 
 	stats := RouteStats{}
+	iterations := 0
 	for state.pq.Len() > 0 {
+		if iterations&0x3ff == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, 0, nil, nil, stats, false, err
+			}
+		}
+		iterations++
 		it := heap.Pop(&state.pq).(*pqItem)
 		u := it.Node
 		if _, blocked := bannedNodes[u]; blocked {
@@ -1002,14 +1087,14 @@ func routeWithConstraints(g *RailGraph, start, goal int, bannedEdges map[edgeKey
 	}
 
 	if state.nodeStamp[goal] != state.epoch {
-		return nil, 0, nil, nil, stats, false
+		return nil, 0, nil, nil, stats, false, nil
 	}
 	path, pathEdges := reconstructPathAndEdges(state.prev, state.prevEdge, start, goal)
 	if len(path) == 0 {
-		return nil, 0, nil, nil, stats, false
+		return nil, 0, nil, nil, stats, false, nil
 	}
 	ways := reconstructWaysFromEdges(pathEdges)
-	return path, state.dist[goal], ways, pathEdges, stats, true
+	return path, state.dist[goal], ways, pathEdges, stats, true, nil
 }
 
 func acquireRouteSearchState(nodeCount int) *routeSearchState {

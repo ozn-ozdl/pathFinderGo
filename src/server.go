@@ -15,6 +15,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/paulmach/osm"
@@ -70,6 +72,7 @@ type Server struct {
 	graph      *RailGraph
 	ifoptIndex map[string][]osm.NodeID
 	mux        *http.ServeMux
+	routeSem   chan struct{}
 }
 
 const cacheSchemaVersion = "v4-f32-compact"
@@ -103,6 +106,7 @@ func main() {
 		graph:      graph,
 		ifoptIndex: buildIFOPTIndex(data),
 		mux:        http.NewServeMux(),
+		routeSem:   make(chan struct{}, clampInt(parseIntDefault(os.Getenv("MAX_CONCURRENT_ROUTES"), runtime.GOMAXPROCS(0)), 1, 32)),
 	}
 	s.registerRoutes()
 
@@ -110,11 +114,28 @@ func main() {
 		Addr:              *addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	log.Printf("server listening on %s", *addr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- srv.ListenAndServe() }()
+	shutdownSignals := make(chan os.Signal, 1)
+	signal.Notify(shutdownSignals, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-serverErrors:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	case <-shutdownSignals:
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
 	}
 }
 
@@ -129,14 +150,56 @@ func (s *Server) registerRoutes() {
 	})
 	s.mux.HandleFunc("/api/v1/stations", s.handleStations)
 	s.mux.HandleFunc("/api/v1/lines", s.handleLines)
-	s.mux.HandleFunc("/api/v1/route", s.handleRouteV1)
-	s.mux.HandleFunc("/api/v1/trip/paths", s.handleTripPathsV1)
+	s.mux.HandleFunc("/api/v1/route", s.withRouteLimit(s.handleRouteV1))
+	s.mux.HandleFunc("/api/v1/trip/paths", s.withRouteLimit(s.handleTripPathsV1))
 
 	// Legacy endpoints (kept for compatibility with older clients/UI)
 	s.mux.HandleFunc("/railway/stations", s.handleStations)
 	s.mux.HandleFunc("/railway/lines", s.handleLines)
-	s.mux.HandleFunc("/railway/route", s.handleRoute)
-	s.mux.HandleFunc("/railway/trip/paths", s.handleTripPaths)
+	s.mux.HandleFunc("/railway/route", s.withRouteLimit(s.handleRoute))
+	s.mux.HandleFunc("/railway/trip/paths", s.withRouteLimit(s.handleTripPaths))
+}
+
+func (s *Server) withRouteLimit(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, 25*time.Second)
+			defer cancel()
+			r = r.WithContext(ctx)
+		}
+		select {
+		case s.routeSem <- struct{}{}:
+			defer func() { <-s.routeSem }()
+			next(w, r)
+		case <-r.Context().Done():
+			http.Error(w, "request canceled while waiting for routing capacity", http.StatusServiceUnavailable)
+		}
+	}
+}
+
+func readBoundedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	const maxBodyBytes = 1 << 20
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	return io.ReadAll(r.Body)
+}
+
+func writeBodyReadError(w http.ResponseWriter, err error) {
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	http.Error(w, "failed to read body", http.StatusBadRequest)
+}
+
+func writeRouteError(w http.ResponseWriter, err error) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		http.Error(w, "routing deadline exceeded", http.StatusGatewayTimeout)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
 type StopRef struct {
@@ -376,9 +439,9 @@ func (s *Server) handleTripPathsV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedBody(w, r)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		writeBodyReadError(w, err)
 		return
 	}
 	tParse0 := time.Now()
@@ -435,7 +498,7 @@ func (s *Server) handleTripPathsV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Reuse the legacy handler logic by calling the core implementation.
-	resp, status, httpErr := s.computeTripPaths(reqID, legacy, decodeMs)
+	resp, status, httpErr := s.computeTripPaths(r.Context(), reqID, legacy, decodeMs)
 	if httpErr != nil {
 		http.Error(w, httpErr.Error(), status)
 		return
@@ -472,10 +535,10 @@ func (s *Server) handleTripPaths(w http.ResponseWriter, r *http.Request) {
 
 	t0 := time.Now()
 	tRead0 := time.Now()
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedBody(w, r)
 	if err != nil {
 		log.Printf("[%s] failed reading body: %v", reqID, err)
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		writeBodyReadError(w, err)
 		return
 	}
 	readMs := time.Since(tRead0).Milliseconds()
@@ -536,7 +599,7 @@ func (s *Server) handleTripPaths(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, status, httpErr := s.computeTripPaths(reqID, req, decodeMs)
+	resp, status, httpErr := s.computeTripPaths(r.Context(), reqID, req, decodeMs)
 	if httpErr != nil {
 		http.Error(w, httpErr.Error(), status)
 		return
@@ -545,7 +608,10 @@ func (s *Server) handleTripPaths(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs int64) (TripPathsResponse, int, error) {
+func (s *Server) computeTripPaths(ctx context.Context, reqID string, req TripPathsRequest, decodeMs int64) (TripPathsResponse, int, error) {
+	if len(req.Stops) > 100 {
+		return TripPathsResponse{}, http.StatusBadRequest, fmt.Errorf("at most 100 stops may be routed")
+	}
 	k := clampInt(req.K, 1, 10)
 	algo := strings.ToLower(strings.TrimSpace(req.Algo))
 	if algo == "" {
@@ -590,7 +656,11 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 		idx := idx
 		go func() {
 			defer stopWg.Done()
-			stopSem <- struct{}{}
+			select {
+			case stopSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-stopSem }()
 			raw := req.Stops[idx]
 			tStopResolve := time.Now()
@@ -603,6 +673,9 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 		}()
 	}
 	stopWg.Wait()
+	if err := ctx.Err(); err != nil {
+		return TripPathsResponse{}, http.StatusGatewayTimeout, err
+	}
 
 	stops := make([]ResolvedStop, nStopsReq)
 	unmatched := make([]ResolvedStop, 0)
@@ -645,7 +718,11 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 		i := i
 		go func() {
 			defer segWg.Done()
-			segSem <- struct{}{}
+			select {
+			case segSem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-segSem }()
 
 			segResolve0 := time.Now()
@@ -678,6 +755,7 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 					UseAccelDecel:               useAccelDecel,
 					CorridorSimilarityThreshold: corridorThreshold,
 					TargetTravelSec:             targetSec,
+					Context:                     ctx,
 				})
 				if routeErr != nil {
 					log.Printf("[%s] segment %d route error: %v", reqID, i, routeErr)
@@ -729,6 +807,9 @@ func (s *Server) computeTripPaths(reqID string, req TripPathsRequest, decodeMs i
 		}()
 	}
 	segWg.Wait()
+	if err := ctx.Err(); err != nil {
+		return TripPathsResponse{}, http.StatusGatewayTimeout, err
+	}
 
 	resp := TripPathsResponse{
 		K:         k,
@@ -1052,10 +1133,19 @@ func (s *Server) handleStations(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	stations := make([]RailwayStation, 0, len(s.data.StationsByID))
+	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	for _, st := range s.data.StationsByID {
+		if query != "" && !strings.Contains(strings.ToLower(st.Name), query) && !strings.Contains(strings.ToLower(st.IFOPT), query) {
+			continue
+		}
 		stations = append(stations, st)
 	}
-	writeJSON(w, http.StatusOK, stations)
+	sort.Slice(stations, func(i, j int) bool { return stations[i].ID < stations[j].ID })
+	start, end := boundedPage(r, len(stations), 500, 2000)
+	if end < len(stations) {
+		w.Header().Set("X-Next-Cursor", strconv.Itoa(end))
+	}
+	writeJSON(w, http.StatusOK, stations[start:end])
 }
 
 func (s *Server) handleLines(w http.ResponseWriter, r *http.Request) {
@@ -1067,10 +1157,29 @@ func (s *Server) handleLines(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
 	lines := make([]RailwayLine, 0, len(s.data.LinesByID))
+	query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 	for _, ln := range s.data.LinesByID {
+		if query != "" && !strings.Contains(strings.ToLower(ln.Name), query) && !strings.Contains(strings.ToLower(ln.Type), query) {
+			continue
+		}
 		lines = append(lines, ln)
 	}
-	writeJSON(w, http.StatusOK, lines)
+	sort.Slice(lines, func(i, j int) bool { return lines[i].ID < lines[j].ID })
+	start, end := boundedPage(r, len(lines), 200, 1000)
+	if end < len(lines) {
+		w.Header().Set("X-Next-Cursor", strconv.Itoa(end))
+	}
+	writeJSON(w, http.StatusOK, lines[start:end])
+}
+
+func boundedPage(r *http.Request, total, defaultLimit, maxLimit int) (int, int) {
+	limit := clampInt(parseIntDefault(r.URL.Query().Get("limit"), defaultLimit), 1, maxLimit)
+	cursor := clampInt(parseIntDefault(r.URL.Query().Get("cursor"), 0), 0, total)
+	end := cursor + limit
+	if end > total {
+		end = total
+	}
+	return cursor, end
 }
 
 type PathResult struct {
@@ -1361,9 +1470,10 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 		K:             k,
 		Algorithm:     algo,
 		UseAccelDecel: useAccelDecel,
+		Context:       r.Context(),
 	})
 	if httpErr != nil {
-		http.Error(w, httpErr.Error(), http.StatusBadRequest)
+		writeRouteError(w, httpErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
@@ -1388,9 +1498,9 @@ func (s *Server) handleRouteV1(w http.ResponseWriter, r *http.Request) {
 	}
 
 	t0 := time.Now()
-	body, err := io.ReadAll(r.Body)
+	body, err := readBoundedBody(w, r)
 	if err != nil {
-		http.Error(w, "failed to read body", http.StatusBadRequest)
+		writeBodyReadError(w, err)
 		return
 	}
 	tParse0 := time.Now()
@@ -1448,9 +1558,10 @@ func (s *Server) handleRouteV1(w http.ResponseWriter, r *http.Request) {
 		Algorithm:                   algo,
 		UseAccelDecel:               useAccelDecel,
 		CorridorSimilarityThreshold: corridorThreshold,
+		Context:                     r.Context(),
 	})
 	if routeErr != nil {
-		http.Error(w, routeErr.Error(), http.StatusBadRequest)
+		writeRouteError(w, routeErr)
 		return
 	}
 	routeMs := routeTimings.TotalMs
