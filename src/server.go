@@ -114,8 +114,8 @@ func main() {
 		Addr:              *addr,
 		Handler:           s.mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       120 * time.Second,
+		WriteTimeout:      120 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
@@ -165,7 +165,7 @@ func (s *Server) withRouteLimit(next http.HandlerFunc) http.HandlerFunc {
 		ctx := r.Context()
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, 25*time.Second)
+			ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
 			r = r.WithContext(ctx)
 		}
